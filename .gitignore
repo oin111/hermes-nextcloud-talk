@@ -1,0 +1,19 @@
+# Credentials
+.env
+*.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Editors and OS
+.vscode/
+.idea/
+.DS_Store
+
+# Local runtime data
+cache/
+logs/
+backups/

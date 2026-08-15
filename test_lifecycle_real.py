@@ -217,62 +217,68 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await self.wait_for_background(instance)
             self.assertEqual(seen, [8, 7])
 
-    def test_overlap_retains_every_exact_ack_and_does_not_floor_delayed_id(self):
+    def test_effective_overlap_retains_exact_ack_without_flooring_recent_delayed_id(self):
+        delayed_id = 4900
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)
-            instance.ack_overlap_ids = 4096
+            instance.ack_overlap_ids = 199
             instance.ack_retention_count = 2048
+            instance.max_poll_batch = 200
             instance._ensure_ack_runtime()
             instance._persist_cursors = lambda: None
 
             for message_id in range(1, 5001):
-                if message_id != 1500:
+                if message_id != delayed_id:
                     instance._commit_cursor("room", message_id)
 
             state = instance._ack_rooms["room"]
-            self.assertEqual(instance.ack_retention_count, 4096)
-            self.assertEqual(state["floor"], 904)
-            self.assertFalse(instance._is_acknowledged("room", 1500))
-            self.assertEqual(instance._poll_anchor("room"), 904)
-            self.assertLessEqual(len(state["successful"]), 4096)
+            self.assertEqual(instance.ack_retention_count, 2048)
+            self.assertEqual(state["floor"], 4801)
+            self.assertFalse(instance._is_acknowledged("room", delayed_id))
+            self.assertEqual(instance._poll_anchor("room"), 4801)
+            self.assertEqual(len(state["successful"]), 198)
 
-            instance._commit_cursor("room", 1500)
-            self.assertTrue(instance._is_acknowledged("room", 1500))
+            instance._commit_cursor("room", delayed_id)
+            self.assertTrue(instance._is_acknowledged("room", delayed_id))
             before = set(state["successful"])
-            instance._commit_cursor("room", 1500)
+            instance._commit_cursor("room", delayed_id)
             self.assertEqual(state["successful"], before)
 
-    def test_retention_reduction_normalizes_restart_without_acknowledging_delayed_gap(self):
-        delayed_id = 1500
+    def test_legacy_oversized_overlap_normalizes_and_persists_on_restart(self):
+        delayed_id = 4900
         with tempfile.TemporaryDirectory() as tmp:
-            old = self.make_adapter(tmp)
-            old.ack_overlap_ids = 8192
-            old.ack_retention_count = 8192
-            for message_id in range(1, 5003):
-                if message_id != delayed_id:
-                    old._commit_cursor("room", message_id)
-
-            persisted_old = json.loads(old._cursor_path.read_text(encoding="utf-8"))
-            self.assertEqual(len(persisted_old["rooms"]["room"]["successful"]), 5001)
-            old._mark_room_initialized("room")
+            instance = self.make_adapter(tmp)
+            instance._cursor_path.parent.mkdir(parents=True, exist_ok=True)
+            legacy_successful = [
+                message_id for message_id in range(1, 5003)
+                if message_id != delayed_id
+            ]
+            instance._cursor_path.write_text(json.dumps({
+                "version": 2,
+                "rooms": {
+                    "room": {
+                        "floor": 0,
+                        "successful": legacy_successful,
+                        "initialized": True,
+                        "last_seen": 1,
+                        "active": True,
+                    }
+                },
+            }), encoding="utf-8")
 
             reduced = self.make_adapter(tmp)
-            reduced.ack_overlap_ids = 4096
+            reduced.max_poll_batch = 200
+            reduced.ack_overlap_ids = 199
             reduced.ack_retention_count = 4096
             reduced._load_cursors()
 
             state = reduced._ack_rooms["room"]
             self.assertTrue(state["initialized"])
-            self.assertEqual(state["floor"], 906)
-            self.assertEqual(reduced._poll_anchor("room"), 906)
-            self.assertEqual(len(state["successful"]), 4095)
+            self.assertEqual(state["floor"], 4803)
+            self.assertEqual(reduced._poll_anchor("room"), 4803)
+            self.assertEqual(len(state["successful"]), 198)
             self.assertFalse(reduced._is_acknowledged("room", delayed_id))
             self.assertTrue(reduced._is_acknowledged("room", 5002))
-            self.assertEqual(
-                len(json.loads(reduced._cursor_path.read_text(encoding="utf-8"))
-                    ["rooms"]["room"]["successful"]),
-                5001,
-            )
 
             before_duplicate = set(state["successful"])
             reduced._commit_cursor("room", 5002)
@@ -280,29 +286,26 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(
                 len(json.loads(reduced._cursor_path.read_text(encoding="utf-8"))
                     ["rooms"]["room"]["successful"]),
-                4095,
+                198,
             )
 
             reduced._commit_cursor("room", delayed_id)
             self.assertTrue(reduced._is_acknowledged("room", delayed_id))
-            before = set(state["successful"])
-            reduced._commit_cursor("room", delayed_id)
-            self.assertEqual(state["successful"], before)
-
             persisted_reduced = json.loads(
                 reduced._cursor_path.read_text(encoding="utf-8")
             )["rooms"]["room"]
             self.assertTrue(persisted_reduced["initialized"])
-            self.assertEqual(persisted_reduced["floor"], 906)
-            self.assertEqual(len(persisted_reduced["successful"]), 4096)
+            self.assertEqual(persisted_reduced["floor"], 4803)
+            self.assertEqual(len(persisted_reduced["successful"]), 199)
 
             restarted = self.make_adapter(tmp)
-            restarted.ack_overlap_ids = 4096
+            restarted.max_poll_batch = 200
+            restarted.ack_overlap_ids = 199
             restarted.ack_retention_count = 4096
             restarted._load_cursors()
             self.assertTrue(restarted._is_room_initialized("room"))
             self.assertEqual(restarted._ack_rooms["room"], reduced._ack_rooms["room"])
-            self.assertEqual(restarted._poll_anchor("room"), 906)
+            self.assertEqual(restarted._poll_anchor("room"), 4803)
 
     async def test_busy_room_leaves_followup_retryable_and_failure_uncommitted(self):
         with tempfile.TemporaryDirectory() as tmp:

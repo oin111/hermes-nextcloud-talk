@@ -1044,6 +1044,40 @@ class AckVersionAndHistoryBoundTests(unittest.TestCase):
 
 
 class ConfigurationTests(unittest.TestCase):
+    def test_ack_overlap_is_clamped_to_one_poll_page(self):
+        with patch.dict(os.environ, {}, clear=True), self.assertLogs(adapter.logger, level="WARNING"):
+            instance = adapter.NextcloudTalkAdapter(PlatformConfig(extra={
+                "max_poll_batch": 200,
+                "ack_overlap_ids": 4096,
+            }))
+        self.assertEqual(instance.ack_overlap_ids, 199)
+
+        with patch.dict(os.environ, {}, clear=True), self.assertLogs(adapter.logger, level="WARNING"):
+            single_item_page = adapter.NextcloudTalkAdapter(PlatformConfig(extra={
+                "max_poll_batch": 1,
+                "ack_overlap_ids": 32,
+            }))
+        self.assertEqual(single_item_page.ack_overlap_ids, 0)
+        single_item_page._ensure_ack_runtime()
+        self.assertEqual(single_item_page.ack_overlap_ids, 0)
+
+        with patch.dict(os.environ, {}, clear=True), self.assertLogs(adapter.logger, level="WARNING"):
+            ten_item_page = adapter.NextcloudTalkAdapter(PlatformConfig(extra={
+                "max_poll_batch": 10,
+                "ack_overlap_ids": 4096,
+            }))
+        ten_item_page._ensure_ack_runtime()
+        self.assertEqual(ten_item_page.ack_overlap_ids, 9)
+
+        with patch.dict(os.environ, {}, clear=True), self.assertLogs(adapter.logger, level="WARNING"):
+            oversized_page = adapter.NextcloudTalkAdapter(PlatformConfig(extra={
+                "max_poll_batch": 4097,
+                "ack_overlap_ids": 4096,
+            }))
+        oversized_page._ensure_ack_runtime()
+        self.assertEqual(oversized_page.max_poll_batch, 200)
+        self.assertEqual(oversized_page.ack_overlap_ids, 199)
+
     def test_tokenless_auto_discovery_configuration_and_registration(self):
         env = {"NEXTCLOUD_TALK_URL": "https://cloud.example", "NEXTCLOUD_TALK_USERNAME": "bot",
                "NEXTCLOUD_TALK_PASSWORD": "secret", "NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS": "true"}
@@ -1773,13 +1807,57 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
                     client._dav_url(path)
                 self.assertEqual(raised.exception.category, "security")
 
+    async def test_empty_list_message_parameters_is_treated_as_no_metadata(self):
+        seen = []
+        instance = self.make_adapter(
+            lambda event: asyncio.sleep(0, result=seen.append((event.message_id, event.text)))
+        )
+        msg = {
+            "id": 9,
+            "actorType": "users",
+            "actorId": "alice",
+            "message": "plain Talk text",
+            "messageParameters": [],
+        }
+        await instance._handle_talk_message(msg, "dm-room", await_completion=True)
+        self.assertEqual(seen, [("9", "plain Talk text")])
+        self.assertEqual(instance._last_message_ids["dm-room"], 9)
+
+    async def test_poll_overlap_fits_page_and_reaches_newest_message(self):
+        seen = []
+        calls = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0))
+        instance.max_poll_batch = 10
+        instance.poll_timeout = 1
+        instance.ack_overlap_ids = 9
+        instance.ack_retention_count = 32
+        instance._persist_cursors = lambda: None
+        for message_id in range(1, 101):
+            instance._commit_cursor("dm-room", message_id)
+
+        async def get_messages(*_args, **kwargs):
+            anchor = kwargs["last_known_id"]
+            limit = kwargs["limit"]
+            calls.append((anchor, limit))
+            return [{"id": value} for value in range(anchor + 1, min(anchor + limit, 101) + 1)]
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+
+        async def record(msg, room):
+            seen.append((msg["id"], room))
+
+        instance._handle_talk_message = record
+        await instance._poll_room("dm-room")
+        self.assertEqual(calls, [(91, 10)])
+        self.assertEqual(seen, [(101, "dm-room")])
+
     async def test_malformed_message_parameters_does_not_block_newer_valid_message(self):
         seen = []
         instance = self.make_adapter(lambda event: asyncio.sleep(0, result=seen.append(event.message_id)))
         instance.poll_timeout = 1
         async def get_messages(*_args, **_kwargs):
             return [
-                {"id": 10, "actorType": "users", "actorId": "alice", "message": "bad", "messageParameters": []},
+                {"id": 10, "actorType": "users", "actorId": "alice", "message": "bad", "messageParameters": ["not-metadata"]},
                 {"id": 11, "actorType": "users", "actorId": "alice", "message": "good"},
             ]
         instance._client = types.SimpleNamespace(get_messages=get_messages)

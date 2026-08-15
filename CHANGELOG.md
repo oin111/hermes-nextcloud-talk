@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.1] - 2026-08-15
+
+### Fixed
+
+- Accept the empty `messageParameters: []` shape emitted by some Talk versions
+  for ordinary text messages while continuing to reject malformed non-empty metadata.
+- Prevent newer-message starvation by capping polling pages at Talk's 200-message
+  protocol maximum and clamping the durable ACK overlap below that page size.
+
 ## [0.1.0] - 2026-08-14
 
 ### Added

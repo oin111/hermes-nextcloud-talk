@@ -32,7 +32,7 @@ Optional:
     NEXTCLOUD_TALK_MAX_ACK_ROOMS=800
     NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES=10000
     NEXTCLOUD_TALK_ACK_RETENTION_COUNT=4096
-    NEXTCLOUD_TALK_ACK_OVERLAP_IDS=4096
+    NEXTCLOUD_TALK_ACK_OVERLAP_IDS=199
     NEXTCLOUD_TALK_PROCESSING_TIMEOUT=300
     NEXTCLOUD_TALK_ALLOW_INSECURE_HTTP=false
     NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK=false
@@ -92,12 +92,13 @@ _DEFAULT_MAX_CACHE_BYTES = 512 * 1024 * 1024
 _DEFAULT_MAX_CACHE_FILES = 2048
 _DEFAULT_MAX_JSON_BYTES = 4 * 1024 * 1024
 _DEFAULT_MAX_BODY_BYTES = 1024 * 1024
-_DEFAULT_MAX_POLL_BATCH = 200
+_MAX_TALK_POLL_BATCH = 200
+_DEFAULT_MAX_POLL_BATCH = _MAX_TALK_POLL_BATCH
 _DEFAULT_MAX_ROOMS = 200
 _ACK_ROOM_LIMIT_MULTIPLIER = 4
 _DEFAULT_MAX_BACKLOG_MESSAGES = 10000
 _DEFAULT_ACK_RETENTION_COUNT = 4096
-_DEFAULT_ACK_OVERLAP_IDS = 4096
+_DEFAULT_ACK_OVERLAP_IDS = _DEFAULT_MAX_POLL_BATCH - 1
 _DEFAULT_PROCESSING_TIMEOUT = 300.0
 _ACK_STATE_VERSION = 2
 _STREAM_CHUNK_SIZE = 64 * 1024
@@ -466,7 +467,9 @@ class NextcloudTalkClient:
         self.allow_public_share_fallback = allow_public_share_fallback
         self.max_json_bytes = max(1, int(max_json_bytes))
         self.max_body_bytes = max(1, int(max_body_bytes))
-        self.max_poll_batch = max(1, int(max_poll_batch))
+        self.max_poll_batch = min(
+            _MAX_TALK_POLL_BATCH, max(1, int(max_poll_batch))
+        )
         self.max_rooms = max(1, int(max_rooms))
         self.max_cache_bytes = max(0, int(max_cache_bytes))
         self.max_cache_files = max(0, int(max_cache_files))
@@ -481,7 +484,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.0",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.1",
         }
 
     @staticmethod
@@ -1398,7 +1401,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         ))
         self.max_json_bytes = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_JSON_BYTES") or extra.get("max_json_bytes", _DEFAULT_MAX_JSON_BYTES)))
         self.max_body_bytes = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_BODY_BYTES") or extra.get("max_body_bytes", _DEFAULT_MAX_BODY_BYTES)))
-        self.max_poll_batch = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_POLL_BATCH") or extra.get("max_poll_batch", _DEFAULT_MAX_POLL_BATCH)))
+        configured_poll_batch = max(1, int(
+            os.getenv("NEXTCLOUD_TALK_MAX_POLL_BATCH")
+            or extra.get("max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
+        ))
+        self.max_poll_batch = min(_MAX_TALK_POLL_BATCH, configured_poll_batch)
+        if configured_poll_batch > _MAX_TALK_POLL_BATCH:
+            logger.warning(
+                "[nextcloud_talk] Poll batch %d exceeds Talk's protocol limit; clamping to %d",
+                configured_poll_batch, _MAX_TALK_POLL_BATCH,
+            )
         self.max_rooms = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_ROOMS") or extra.get("max_rooms", _DEFAULT_MAX_ROOMS)))
         configured_ack_rooms = os.getenv("NEXTCLOUD_TALK_MAX_ACK_ROOMS") or extra.get("max_ack_rooms")
         self.max_ack_rooms = max(
@@ -1489,6 +1501,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             os.getenv("NEXTCLOUD_TALK_ACK_OVERLAP_IDS")
             or extra.get("ack_overlap_ids", _DEFAULT_ACK_OVERLAP_IDS)
         ))
+        max_safe_overlap = max(0, self.max_poll_batch - 1)
+        if self.ack_overlap_ids > max_safe_overlap:
+            logger.warning(
+                "[nextcloud_talk] ACK overlap %d exceeds one poll page; clamping to %d "
+                "to prevent newer-message starvation",
+                self.ack_overlap_ids, max_safe_overlap,
+            )
+            self.ack_overlap_ids = max_safe_overlap
         if self.ack_retention_count < self.ack_overlap_ids:
             logger.warning(
                 "[nextcloud_talk] ACK retention %d is below overlap %d; clamping retention to %d",
@@ -1831,7 +1851,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self.ack_retention_count = _DEFAULT_ACK_RETENTION_COUNT
         if not hasattr(self, "ack_overlap_ids"):
             self.ack_overlap_ids = _DEFAULT_ACK_OVERLAP_IDS
-        self.ack_overlap_ids = max(32, int(self.ack_overlap_ids))
+        if not hasattr(self, "max_poll_batch"):
+            self.max_poll_batch = _DEFAULT_MAX_POLL_BATCH
+        self.max_poll_batch = min(
+            _MAX_TALK_POLL_BATCH, max(1, int(self.max_poll_batch))
+        )
+        max_safe_overlap = max(0, int(self.max_poll_batch) - 1)
+        self.ack_overlap_ids = max(
+            0, min(int(self.ack_overlap_ids), max_safe_overlap)
+        )
         self.ack_retention_count = max(
             32, int(self.ack_retention_count), self.ack_overlap_ids
         )
@@ -2358,13 +2386,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._ensure_ack_runtime()
             if self._inflight_message_ids.get(room_token):
                 return
+            max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
             messages = await self._client.get_messages(
                 room_token,
                 last_known_id=self._poll_anchor(room_token),
                 look_into_future=True,
                 timeout=self.poll_timeout,
+                limit=max_batch,
             )
-            max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
             if not isinstance(messages, list):
                 raise NextcloudTalkAPIError("chat response data is not a list", category="protocol")
             if len(messages) > max_batch:
@@ -2576,6 +2605,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         raw_file_refs = msg.get("messageParameters", {})
         if raw_file_refs is None:
+            raw_file_refs = {}
+        # Talk serializes an empty parameter map as [] on some server versions.
+        # A non-empty list is still malformed and must fail closed.
+        if raw_file_refs == []:
             raw_file_refs = {}
         if not isinstance(raw_file_refs, dict):
             logger.warning(

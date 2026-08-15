@@ -165,7 +165,7 @@ NEXTCLOUD_TALK_MAX_ROOMS=200
 NEXTCLOUD_TALK_MAX_ACK_ROOMS=800
 NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES=10000
 NEXTCLOUD_TALK_ACK_RETENTION_COUNT=4096
-NEXTCLOUD_TALK_ACK_OVERLAP_IDS=4096
+NEXTCLOUD_TALK_ACK_OVERLAP_IDS=199
 NEXTCLOUD_TALK_PROCESSING_TIMEOUT=300
 NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK=false
 ```
@@ -179,10 +179,11 @@ Room ACK ledgers are persisted atomically with mode `0600` under the active prof
 Hermes cache. A message is acknowledged only after deterministic pre-dispatch ignore
 or a real Hermes `ProcessingOutcome.SUCCESS`; handler, tool, delivery, cancellation,
 and shutdown failures remain retryable. The ledger retains up to 4,096 successful IDs
-and polls with a 4,096-ID overlap by default, so delayed lower Talk IDs are deduplicated
-without being discarded merely because a higher ID arrived first. Both bounds are
-configurable above; retention is clamped upward to overlap if configured lower, and
-messages delayed beyond the configured overlap are outside the retention guarantee.
+and polls with a 199-ID overlap inside the default 200-message response page, so delayed
+lower Talk IDs are deduplicated without starving newer messages behind acknowledged
+history. Both bounds are configurable above; overlap is clamped to one less than the
+poll batch size, retention is clamped upward to overlap if configured lower, and messages
+delayed beyond the effective overlap are outside the retention guarantee.
 Inactive room ACK history is LRU-bounded by `NEXTCLOUD_TALK_MAX_ACK_ROOMS` (800 by
 default, and never lower than `NEXTCLOUD_TALK_MAX_ROOMS`); configured, discovered,
 initializing, and in-flight rooms are not evicted. `NEXTCLOUD_TALK_PROCESSING_TIMEOUT`

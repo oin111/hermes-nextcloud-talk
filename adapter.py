@@ -120,6 +120,16 @@ _MAX_ATTACHMENT_CACHE_MANIFEST_BYTES = 1024
 _PERMANENT_ATTACHMENT_HTTP_STATUSES = {400, 404, 410, 413, 414, 415, 416, 422}
 
 
+def _normalize_poll_batch(value: Any) -> int:
+    """Clamp a requested page size to Talk's protocol-supported range."""
+    return min(_MAX_TALK_POLL_BATCH, max(1, int(value)))
+
+
+def _normalize_ack_overlap(value: Any, poll_batch: Any) -> int:
+    """Keep ACK overlap non-negative and strictly smaller than one page."""
+    return max(0, min(int(value), _normalize_poll_batch(poll_batch) - 1))
+
+
 def _safe_log_text(value: Any, limit: int = 500) -> str:
     text = str(value or "")
     return re.sub(r"[\x00-\x1f\x7f-\x9f]", "?", text)[:limit]
@@ -467,9 +477,7 @@ class NextcloudTalkClient:
         self.allow_public_share_fallback = allow_public_share_fallback
         self.max_json_bytes = max(1, int(max_json_bytes))
         self.max_body_bytes = max(1, int(max_body_bytes))
-        self.max_poll_batch = min(
-            _MAX_TALK_POLL_BATCH, max(1, int(max_poll_batch))
-        )
+        self.max_poll_batch = _normalize_poll_batch(max_poll_batch)
         self.max_rooms = max(1, int(max_rooms))
         self.max_cache_bytes = max(0, int(max_cache_bytes))
         self.max_cache_files = max(0, int(max_cache_files))
@@ -484,7 +492,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.1",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.2",
         }
 
     @staticmethod
@@ -1405,7 +1413,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             os.getenv("NEXTCLOUD_TALK_MAX_POLL_BATCH")
             or extra.get("max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
         ))
-        self.max_poll_batch = min(_MAX_TALK_POLL_BATCH, configured_poll_batch)
+        self.max_poll_batch = _normalize_poll_batch(configured_poll_batch)
         if configured_poll_batch > _MAX_TALK_POLL_BATCH:
             logger.warning(
                 "[nextcloud_talk] Poll batch %d exceeds Talk's protocol limit; clamping to %d",
@@ -1497,18 +1505,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             os.getenv("NEXTCLOUD_TALK_ACK_RETENTION_COUNT")
             or extra.get("ack_retention_count", _DEFAULT_ACK_RETENTION_COUNT)
         ))
-        self.ack_overlap_ids = max(32, int(
+        configured_ack_overlap = int(
             os.getenv("NEXTCLOUD_TALK_ACK_OVERLAP_IDS")
             or extra.get("ack_overlap_ids", _DEFAULT_ACK_OVERLAP_IDS)
-        ))
-        max_safe_overlap = max(0, self.max_poll_batch - 1)
-        if self.ack_overlap_ids > max_safe_overlap:
+        )
+        self.ack_overlap_ids = _normalize_ack_overlap(
+            configured_ack_overlap, self.max_poll_batch
+        )
+        if configured_ack_overlap > self.ack_overlap_ids:
             logger.warning(
                 "[nextcloud_talk] ACK overlap %d exceeds one poll page; clamping to %d "
                 "to prevent newer-message starvation",
-                self.ack_overlap_ids, max_safe_overlap,
+                configured_ack_overlap, self.ack_overlap_ids,
             )
-            self.ack_overlap_ids = max_safe_overlap
         if self.ack_retention_count < self.ack_overlap_ids:
             logger.warning(
                 "[nextcloud_talk] ACK retention %d is below overlap %d; clamping retention to %d",
@@ -1853,12 +1862,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self.ack_overlap_ids = _DEFAULT_ACK_OVERLAP_IDS
         if not hasattr(self, "max_poll_batch"):
             self.max_poll_batch = _DEFAULT_MAX_POLL_BATCH
-        self.max_poll_batch = min(
-            _MAX_TALK_POLL_BATCH, max(1, int(self.max_poll_batch))
-        )
-        max_safe_overlap = max(0, int(self.max_poll_batch) - 1)
-        self.ack_overlap_ids = max(
-            0, min(int(self.ack_overlap_ids), max_safe_overlap)
+        self.max_poll_batch = _normalize_poll_batch(self.max_poll_batch)
+        self.ack_overlap_ids = _normalize_ack_overlap(
+            self.ack_overlap_ids, self.max_poll_batch
         )
         self.ack_retention_count = max(
             32, int(self.ack_retention_count), self.ack_overlap_ids

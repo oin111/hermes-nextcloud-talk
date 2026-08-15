@@ -1078,6 +1078,19 @@ class ConfigurationTests(unittest.TestCase):
         self.assertEqual(oversized_page.max_poll_batch, 200)
         self.assertEqual(oversized_page.ack_overlap_ids, 199)
 
+    def test_ack_overlap_honors_configured_values_below_legacy_floor(self):
+        for configured_overlap in (0, 1, 31):
+            with self.subTest(configured_overlap=configured_overlap), patch.dict(
+                os.environ, {}, clear=True
+            ):
+                instance = adapter.NextcloudTalkAdapter(PlatformConfig(extra={
+                    "max_poll_batch": 200,
+                    "ack_overlap_ids": configured_overlap,
+                }))
+            self.assertEqual(instance.ack_overlap_ids, configured_overlap)
+            instance._ensure_ack_runtime()
+            self.assertEqual(instance.ack_overlap_ids, configured_overlap)
+
     def test_tokenless_auto_discovery_configuration_and_registration(self):
         env = {"NEXTCLOUD_TALK_URL": "https://cloud.example", "NEXTCLOUD_TALK_USERNAME": "bot",
                "NEXTCLOUD_TALK_PASSWORD": "secret", "NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS": "true"}

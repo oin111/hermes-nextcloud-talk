@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.2] - 2026-08-15
+
+### Fixed
+
+- Honor explicitly configured ACK overlap values from 0 through 31 instead of
+  silently raising them to the legacy minimum of 32.
+- Centralize poll-page and ACK-overlap normalization across configuration,
+  client construction, and legacy runtime state.
+
 ## [0.1.1] - 2026-08-15
 
 ### Fixed

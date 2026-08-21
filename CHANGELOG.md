@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.3] - 2026-08-21
+
+### Fixed
+
+- Prevent ACK-overlap replay from bypassing Talk long polling and driving a
+  tight PHP-FPM request loop. ACK-only overlap pages now advance to a live
+  long-poll anchored at the highest returned acknowledged message ID.
+- Keep the live anchor ephemeral so subsequent cycles recheck the durable
+  overlap window and can recover retryable gaps.
+
 ## [0.1.2] - 2026-08-15
 
 ### Fixed

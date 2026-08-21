@@ -1864,6 +1864,91 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(calls, [(91, 10)])
         self.assertEqual(seen, [(101, "dm-room")])
 
+    async def test_poll_ack_only_overlap_switches_to_live_long_poll_anchor(self):
+        calls = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0))
+        instance.max_poll_batch = 10
+        instance.poll_timeout = 30
+        instance.ack_overlap_ids = 9
+        instance.ack_retention_count = 32
+        instance._persist_cursors = lambda: None
+        for message_id in range(1, 101):
+            instance._commit_cursor("dm-room", message_id)
+
+        async def get_messages(*_args, **kwargs):
+            anchor = kwargs["last_known_id"]
+            calls.append((anchor, kwargs["timeout"], kwargs["limit"]))
+            if len(calls) == 1:
+                return [{"id": value} for value in range(92, 101)]
+            return []
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        await instance._poll_room("dm-room")
+
+        self.assertEqual(calls, [(91, 30, 10), (100, 30, 10)])
+
+    async def test_poll_ack_only_overlap_live_response_dispatches_fresh_message(self):
+        seen = []
+        calls = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0))
+        instance.max_poll_batch = 10
+        instance.poll_timeout = 30
+        instance.ack_overlap_ids = 9
+        instance.ack_retention_count = 32
+        instance._persist_cursors = lambda: None
+        for message_id in range(1, 101):
+            instance._commit_cursor("dm-room", message_id)
+
+        async def get_messages(*_args, **kwargs):
+            calls.append(kwargs["last_known_id"])
+            if len(calls) == 1:
+                return [{"id": value} for value in range(92, 101)]
+            return [{"id": 101}]
+
+        async def record(msg, room):
+            seen.append((msg["id"], room))
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        instance._handle_talk_message = record
+        await instance._poll_room("dm-room")
+
+        self.assertEqual(calls, [91, 100])
+        self.assertEqual(seen, [(101, "dm-room")])
+
+    async def test_live_poll_anchor_is_not_persisted_past_omitted_retryable_gap(self):
+        seen = []
+        calls = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0))
+        instance.max_poll_batch = 10
+        instance.poll_timeout = 30
+        instance.ack_overlap_ids = 9
+        instance.ack_retention_count = 32
+        instance._persist_cursors = lambda: None
+        for message_id in [*range(1, 95), *range(96, 101)]:
+            instance._commit_cursor("dm-room", message_id)
+
+        responses = [
+            [{"id": value} for value in [92, 93, 94, 96, 97, 98, 99, 100]],
+            [],
+            [{"id": 95}],
+        ]
+
+        async def get_messages(*_args, **kwargs):
+            calls.append(kwargs["last_known_id"])
+            return responses.pop(0)
+
+        async def record(msg, room):
+            seen.append((msg["id"], room))
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        instance._handle_talk_message = record
+        await instance._poll_room("dm-room")
+        await instance._poll_room("dm-room")
+
+        self.assertEqual(calls, [91, 100, 91])
+        self.assertEqual(seen, [(95, "dm-room")])
+        self.assertFalse(instance._is_acknowledged("dm-room", 95))
+
     async def test_malformed_message_parameters_does_not_block_newer_valid_message(self):
         seen = []
         instance = self.make_adapter(lambda event: asyncio.sleep(0, result=seen.append(event.message_id)))

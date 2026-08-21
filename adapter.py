@@ -492,7 +492,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.2",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.3",
         }
 
     @staticmethod
@@ -2393,29 +2393,48 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             if self._inflight_message_ids.get(room_token):
                 return
             max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
+            poll_anchor = self._poll_anchor(room_token)
             messages = await self._client.get_messages(
                 room_token,
-                last_known_id=self._poll_anchor(room_token),
+                last_known_id=poll_anchor,
                 look_into_future=True,
                 timeout=self.poll_timeout,
                 limit=max_batch,
             )
-            if not isinstance(messages, list):
-                raise NextcloudTalkAPIError("chat response data is not a list", category="protocol")
-            if len(messages) > max_batch:
-                raise NextcloudTalkAPIError("chat response exceeds poll batch limit", category="overflow")
-            normalized: Dict[int, dict] = {}
-            malformed = 0
-            for msg in messages:
-                if not isinstance(msg, dict):
-                    malformed += 1
-                    continue
-                message_id = _strict_talk_message_id(msg.get("id"))
-                if message_id is None:
-                    malformed += 1
-                    continue
-                if not self._is_acknowledged(room_token, message_id):
-                    normalized[message_id] = msg
+
+            def normalize_batch(batch: Any) -> tuple[Dict[int, dict], int, List[int]]:
+                if not isinstance(batch, list):
+                    raise NextcloudTalkAPIError("chat response data is not a list", category="protocol")
+                if len(batch) > max_batch:
+                    raise NextcloudTalkAPIError("chat response exceeds poll batch limit", category="overflow")
+                normalized_batch: Dict[int, dict] = {}
+                malformed_count = 0
+                valid_ids: List[int] = []
+                for msg in batch:
+                    if not isinstance(msg, dict):
+                        malformed_count += 1
+                        continue
+                    message_id = _strict_talk_message_id(msg.get("id"))
+                    if message_id is None:
+                        malformed_count += 1
+                        continue
+                    valid_ids.append(message_id)
+                    if not self._is_acknowledged(room_token, message_id):
+                        normalized_batch[message_id] = msg
+                return normalized_batch, malformed_count, valid_ids
+
+            normalized, malformed, valid_ids = normalize_batch(messages)
+            if messages and not normalized and not malformed and valid_ids:
+                live_anchor = max(valid_ids)
+                if poll_anchor is None or live_anchor > poll_anchor:
+                    messages = await self._client.get_messages(
+                        room_token,
+                        last_known_id=live_anchor,
+                        look_into_future=True,
+                        timeout=self.poll_timeout,
+                        limit=max_batch,
+                    )
+                    normalized, malformed, _ = normalize_batch(messages)
             if malformed:
                 logger.warning(
                     "[nextcloud_talk] Ignored %d poll message(s) with malformed/missing IDs in room %s",

@@ -28,13 +28,13 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 ## Install
 
 ```bash
-hermes plugins install oin111/hermes-nextcloud-talk --enable
+hermes plugins install oin111/hermes-nextcloud-talk/plugin --enable
 ```
 
 For a reproducible installation, pin a full commit SHA:
 
 ```bash
-hermes plugins install oin111/hermes-nextcloud-talk \
+hermes plugins install oin111/hermes-nextcloud-talk/plugin \
   --ref <full-40-character-commit-sha> --enable
 ```
 
@@ -256,13 +256,14 @@ The bot account therefore needs normal Files/WebDAV access. Uploaded files are s
 ## Verify
 
 ```bash
-python3 -m py_compile adapter.py test_adapter.py test_lifecycle_real.py
-python3 -m unittest -q test_adapter
+python3 -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_packaging.py
+python3 -m unittest -q test_adapter test_packaging
 
 # Real lifecycle probes must use the environment of the installed `hermes` command.
 HERMES_PY="$(python3 -c 'import os, shutil; p=shutil.which("hermes"); print(os.path.join(os.path.dirname(os.path.realpath(p)), "python3"))')"
 "$HERMES_PY" -m unittest -q test_lifecycle_real
-hermes plugins doctor --ci .
+python3 -m unittest -q test_packaging
+hermes plugins doctor --ci plugin/
 ```
 
 The standalone checks need only `python3`. If the shell resolution above is not

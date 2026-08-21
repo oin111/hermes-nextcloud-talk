@@ -26,8 +26,13 @@ jobs:
           git -C "${RUNNER_TEMP}/hermes-agent" checkout c896c09c42910c584c4c7d2325b58c14713ea42c
           python -m pip install -e "${RUNNER_TEMP}/hermes-agent"
       - name: Compile
-        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py
+        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_packaging.py
       - name: Combined unit and real lifecycle tests
-        run: python -m unittest -q test_adapter test_lifecycle_real
+        run: python -m unittest -q test_adapter test_lifecycle_real test_packaging
       - name: Plugin doctor
-        run: hermes plugins doctor --ci .
+        run: hermes plugins doctor --ci plugin/
+      - name: Install-time security scan
+        run: >-
+          python -c "from pathlib import Path; from tools.plugin_guard import scan_plugin,
+          should_allow_plugin_install; result=scan_plugin(Path('plugin'), source='ci/runtime-bundle');
+          allowed, reason=should_allow_plugin_install(result); assert allowed is True, reason"

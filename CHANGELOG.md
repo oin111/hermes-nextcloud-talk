@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.4] - 2026-08-21
+
+### Fixed
+
+- Ship a scanner-safe runtime bundle under `plugin/` so immutable community
+  installs scan only executable plugin files, not adversarial tests or CI.
+- Document and test the subdirectory install path while keeping the reviewed
+  root runtime files byte-identical to the published bundle.
+
 ## [0.1.3] - 2026-08-21
 
 ### Fixed

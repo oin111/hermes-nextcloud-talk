@@ -492,7 +492,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.4",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.5",
         }
 
     @staticmethod

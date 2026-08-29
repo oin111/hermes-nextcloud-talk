@@ -176,6 +176,170 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             persisted = json.loads(instance._cursor_path.read_text(encoding="utf-8"))
             self.assertEqual(persisted["rooms"]["room"]["successful"], [42])
 
+    async def test_watchdog_does_not_replay_while_real_handler_task_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.02
+            started = asyncio.Event()
+            release = asyncio.Event()
+            calls = []
+
+            async def handler(event):
+                calls.append(event)
+                started.set()
+                await release.wait()
+                return None
+
+            instance.set_message_handler(handler)
+            message = {**_MESSAGE, "id": 43}
+            await instance._handle_talk_message(message, "room")
+            await asyncio.wait_for(started.wait(), timeout=1)
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(instance._inflight_message_ids["room"], {43})
+            self.assertFalse(instance._is_acknowledged("room", 43))
+            await instance._handle_talk_message(message, "room")
+            self.assertEqual([event.message_id for event in calls], ["43"])
+
+            release.set()
+            await self.wait_for_background(instance)
+            self.assertTrue(instance._is_acknowledged("room", 43))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+            self.assertEqual(instance._completion_watchdogs, {})
+            self.assertNotIn("nextcloud_talk_processing_task", calls[0].metadata)
+
+    async def test_watchdog_does_not_replay_event_held_in_busy_queue(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.02
+            calls = []
+            queued = []
+
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice"
+            )
+            session_key = build_session_key(source)
+            instance._active_sessions[session_key] = asyncio.Event()
+
+            async def queue(event, active_session_key):
+                queued.append(event)
+                instance._pending_messages[active_session_key] = event
+                return True
+
+            async def handler(event):
+                calls.append(event.message_id)
+                return None
+
+            instance.set_busy_session_handler(queue)
+            instance.set_message_handler(handler)
+            message = {**_MESSAGE, "id": 46}
+            await instance._handle_talk_message(message, "room")
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(instance._inflight_message_ids["room"], {46})
+            self.assertFalse(instance._is_acknowledged("room", 46))
+            await instance._handle_talk_message(message, "room")
+            self.assertEqual(len(queued), 1)
+            self.assertEqual(calls, [])
+
+            pending = instance._pending_messages.pop(session_key)
+            instance._active_sessions.pop(session_key, None)
+            instance._start_session_processing(pending, session_key)
+            await self.wait_for_background(instance)
+
+            self.assertEqual(calls, ["46"])
+            self.assertTrue(instance._is_acknowledged("room", 46))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+            self.assertEqual(instance._completion_watchdogs, {})
+
+    async def test_watchdog_does_not_replay_during_busy_queue_handoff(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.02
+            handoff_release = asyncio.Event()
+
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice"
+            )
+            session_key = build_session_key(source)
+            instance._active_sessions[session_key] = asyncio.Event()
+
+            async def queue(event, active_session_key):
+                instance._pending_messages[active_session_key] = event
+                return True
+
+            instance.set_busy_session_handler(queue)
+            instance.set_message_handler(lambda _event: asyncio.sleep(0))
+            await instance._handle_talk_message({**_MESSAGE, "id": 47}, "room")
+
+            instance._pending_messages.pop(session_key)
+            handoff_task = asyncio.create_task(handoff_release.wait())
+            instance._session_tasks[session_key] = handoff_task
+            await asyncio.sleep(0.05)
+
+            self.assertEqual(instance._inflight_message_ids["room"], {47})
+            self.assertFalse(instance._is_acknowledged("room", 47))
+
+            handoff_release.set()
+            await handoff_task
+            instance._session_tasks.pop(session_key, None)
+            await asyncio.sleep(0.05)
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+            self.assertFalse(instance._is_acknowledged("room", 47))
+
+    async def test_watchdog_does_not_borrow_another_rooms_live_handler_task(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.02
+            instance._room_types = {"room-a": 1, "room-b": 1}
+            busy_started = asyncio.Event()
+            release_busy = asyncio.Event()
+            handler_started = asyncio.Event()
+            release_handler = asyncio.Event()
+
+            source_a = instance.build_source(
+                chat_id="room-a", chat_type="dm", user_id="alice"
+            )
+            session_a = build_session_key(source_a)
+            instance._active_sessions[session_a] = asyncio.Event()
+
+            async def defer(event, session_key):
+                instance._pending_messages[session_key] = event
+                busy_started.set()
+                await release_busy.wait()
+                return True
+
+            async def handler(event):
+                if event.source.chat_id == "room-b":
+                    handler_started.set()
+                    await release_handler.wait()
+                return None
+
+            instance.set_busy_session_handler(defer)
+            instance.set_message_handler(handler)
+            dispatch_a = asyncio.create_task(
+                instance._handle_talk_message(
+                    {**_MESSAGE, "id": 44}, "room-a"
+                )
+            )
+            await asyncio.wait_for(busy_started.wait(), timeout=1)
+            await instance._handle_talk_message(
+                {**_MESSAGE, "id": 45}, "room-b"
+            )
+            await asyncio.wait_for(handler_started.wait(), timeout=1)
+            release_busy.set()
+            await dispatch_a
+            instance._pending_messages.pop(session_a, None)
+            await asyncio.sleep(0.05)
+
+            self.assertFalse(instance._inflight_message_ids.get("room-a"))
+            self.assertFalse(instance._is_acknowledged("room-a", 44))
+            self.assertEqual(instance._inflight_message_ids["room-b"], {45})
+
+            release_handler.set()
+            await self.wait_for_background(instance)
+            self.assertTrue(instance._is_acknowledged("room-b", 45))
+
     async def test_background_failure_is_retryable_after_restart(self):
         with tempfile.TemporaryDirectory() as tmp:
             failed = self.make_adapter(tmp)
@@ -607,6 +771,7 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 message = {**_MESSAGE, "id": 882}
                 await instance._handle_talk_message(message, "room")
                 generation_a = captured[-1].metadata["nextcloud_talk_generation"]
+                instance._pending_messages.pop(key, None)
                 await asyncio.sleep(0.05)
                 self.assertFalse(instance._inflight_message_ids.get("room"))
 
@@ -733,6 +898,7 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             instance.set_busy_session_handler(queue)
             await instance._handle_talk_message({**_MESSAGE, "id": 87}, "room")
             self.assertEqual(instance._inflight_message_ids["room"], {87})
+            instance._pending_messages.pop(key, None)
             await asyncio.sleep(0.05)
             self.assertFalse(instance._inflight_message_ids.get("room"))
             self.assertFalse(instance._is_acknowledged("room", 87))

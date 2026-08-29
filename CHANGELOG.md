@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Keep a Talk message inflight while its real Hermes background handler task is
+  still running or while the exact event remains in Hermes' busy-session queue,
+  preventing the processing watchdog from replaying long and queued turns.
+- Preserve retry behavior when neither a live handler task nor an owned queued
+  event remains and lifecycle completion is genuinely lost.
+
 ## [0.1.4] - 2026-08-21
 
 ### Fixed

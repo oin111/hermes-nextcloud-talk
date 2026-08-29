@@ -1539,6 +1539,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             metadata = getattr(event, "metadata", None)
             if isinstance(metadata, dict):
                 metadata["nextcloud_talk_handler_state"] = "running"
+                metadata["nextcloud_talk_processing_task"] = asyncio.current_task()
             try:
                 result = await handler(event)
             except BaseException:
@@ -2503,6 +2504,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._generation_outcomes.pop(key, None)
         self._inflight_message_ids.get(room_token, set()).discard(numeric_id)
         metadata = getattr(event, "metadata", None) or {}
+        metadata.pop("nextcloud_talk_processing_task", None)
         metadata["nextcloud_talk_processing_outcome"] = getattr(
             ProcessingOutcome.FAILURE, "value", str(ProcessingOutcome.FAILURE)
         )
@@ -2516,14 +2518,42 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     ) -> None:
         key = (room_token, numeric_id, generation)
         try:
-            await asyncio.sleep(self.processing_timeout)
-            if self._generation_is_current(key):
+            while self._generation_is_current(key):
+                await asyncio.sleep(self.processing_timeout)
+                if not self._generation_is_current(key):
+                    return
+                metadata = getattr(event, "metadata", None) or {}
+                processing_task = metadata.get("nextcloud_talk_processing_task")
+                if isinstance(processing_task, asyncio.Task) and not processing_task.done():
+                    logger.info(
+                        "[nextcloud_talk] Processing timeout reached for room %s; "
+                        "handler is still active, extending watchdog",
+                        self._safe_room_token(room_token),
+                    )
+                    continue
+                if self._event_is_deferred(event):
+                    logger.info(
+                        "[nextcloud_talk] Processing timeout reached for room %s; "
+                        "event is still queued, extending watchdog",
+                        self._safe_room_token(room_token),
+                    )
+                    continue
+                session_key = metadata.get("nextcloud_talk_busy_session_key")
+                session_task = getattr(self, "_session_tasks", {}).get(session_key)
+                if isinstance(session_task, asyncio.Task) and not session_task.done():
+                    logger.info(
+                        "[nextcloud_talk] Processing timeout reached for room %s; "
+                        "busy-session handoff is still active, extending watchdog",
+                        self._safe_room_token(room_token),
+                    )
+                    continue
                 logger.warning(
                     "[nextcloud_talk] Processing completion timed out for room %s; "
                     "leaving message retryable",
                     self._safe_room_token(room_token),
                 )
                 self._finish_without_ack(event, room_token, numeric_id, generation)
+                return
         except asyncio.CancelledError:
             raise
         finally:
@@ -2911,6 +2941,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             and not watchdog.done()
         ):
             watchdog.cancel()
+        metadata.pop("nextcloud_talk_processing_task", None)
         self._current_generations.pop((room_token, numeric_id), None)
         self._inflight_generations.pop(key, None)
         self._generation_outcomes.pop(key, None)

@@ -492,7 +492,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.5",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.6",
         }
 
     @staticmethod
@@ -1553,6 +1553,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 except Exception:
                     reply_text = result
                 metadata["nextcloud_talk_reply_required"] = bool(reply_text)
+                text_required = bool(reply_text)
+                media_expected = False
+                if isinstance(reply_text, str):
+                    try:
+                        media_files, remaining = self.extract_media(reply_text)
+                        images, remaining = self.extract_images(remaining)
+                        local_files, remaining = self.extract_local_files(remaining)
+                        media_expected = bool(media_files or images or local_files)
+                        text_required = bool(remaining.strip())
+                    except Exception:
+                        # Fail closed: an unclassifiable non-empty reply must not
+                        # be treated as text-only during disconnect reconciliation.
+                        media_expected = bool(reply_text)
+                metadata["nextcloud_talk_text_delivery_required"] = text_required
+                metadata["nextcloud_talk_media_expected"] = media_expected
             return result
 
         base_setter = getattr(super(), "set_message_handler", None)
@@ -1560,6 +1575,30 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             base_setter(tracked)
         else:
             self._message_handler = tracked
+
+    async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
+        if hook_name == "on_processing_complete" and len(args) >= 2:
+            event, outcome = args[0], args[1]
+            metadata = getattr(event, "metadata", None)
+            if isinstance(metadata, dict):
+                metadata["nextcloud_talk_terminal_outcome"] = getattr(
+                    outcome, "value", str(outcome)
+                )
+        await super()._run_processing_hook(hook_name, *args, **kwargs)
+
+    async def _process_message_background(
+        self, event: MessageEvent, session_key: str
+    ) -> None:
+        """Bind delivery tracking to the exact Talk generation being drained."""
+        self._ensure_ack_runtime()
+        generation_key = self._event_generation_key(event)
+        if generation_key is None or not self._generation_is_current(generation_key):
+            generation_key = None
+        context_token = self._dispatch_generation_context.set(generation_key)
+        try:
+            await super()._process_message_background(event, session_key)
+        finally:
+            self._dispatch_generation_context.reset(context_token)
 
     def set_busy_session_handler(self, handler) -> None:
         """Track whether Base synchronously consumed or deferred this event."""
@@ -1648,6 +1687,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     1024, int(state.get("media_failure_count", 0)) + 1
                 )
 
+    async def _notify_media_delivery_failure(
+        self,
+        chat_id: str,
+        media_path: str,
+        *,
+        is_voice: bool = False,
+        metadata: Optional[Dict[str, Any]] = None,
+    ) -> None:
+        await super()._notify_media_delivery_failure(
+            chat_id,
+            media_path,
+            is_voice=is_voice,
+            metadata=metadata,
+        )
+
     async def connect(self, **kwargs) -> bool:
         if not validate_config(self.config):
             self._set_fatal_error(
@@ -1720,6 +1774,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 pass
         self._poll_task = None
         self._ensure_ack_runtime()
+        for key, event in list(self._inflight_generations.items()):
+            if not self._generation_has_confirmed_success(event, key):
+                continue
+            try:
+                await self.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+            except Exception as exc:
+                logger.warning(
+                    "[nextcloud_talk] Could not commit confirmed processing during "
+                    "disconnect: %s",
+                    _safe_outward_error_text(exc),
+                )
         watchdogs = list(self._completion_watchdogs.values())
         for task in watchdogs:
             if not task.done():
@@ -2513,6 +2578,34 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             completion_event.set()
         return True
 
+    def _generation_has_confirmed_success(
+        self, event: MessageEvent, key: tuple[str, int, int]
+    ) -> bool:
+        """Return true only when handler and required delivery both completed."""
+        if not self._generation_is_current(key):
+            return False
+        metadata = getattr(event, "metadata", None) or {}
+        if metadata.get("nextcloud_talk_handler_state") != "success":
+            return False
+        state = self._generation_outcomes.get(key, {})
+        if state.get("media_delivery_failed") is True:
+            return False
+        success_value = getattr(
+            ProcessingOutcome.SUCCESS, "value", str(ProcessingOutcome.SUCCESS)
+        )
+        if (
+            metadata.get("nextcloud_talk_media_expected") is True
+            and metadata.get("nextcloud_talk_terminal_outcome") != success_value
+        ):
+            return False
+        return not (
+            metadata.get(
+                "nextcloud_talk_text_delivery_required",
+                metadata.get("nextcloud_talk_reply_required") is True,
+            ) is True
+            and state.get("delivery_succeeded") is not True
+        )
+
     async def _completion_watchdog(
         self, event: MessageEvent, room_token: str, numeric_id: int, generation: int
     ) -> None:
@@ -2547,6 +2640,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         self._safe_room_token(room_token),
                     )
                     continue
+                if self._generation_has_confirmed_success(event, key):
+                    logger.info(
+                        "[nextcloud_talk] Completion hook was not observed for room %s; "
+                        "committing confirmed successful processing",
+                        self._safe_room_token(room_token),
+                    )
+                    try:
+                        await self.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+                    except Exception as exc:
+                        logger.warning(
+                            "[nextcloud_talk] Could not commit confirmed processing: %s",
+                            _safe_outward_error_text(exc),
+                        )
+                    return
                 logger.warning(
                     "[nextcloud_talk] Processing completion timed out for room %s; "
                     "leaving message retryable",
@@ -2602,7 +2709,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             metadata.get("nextcloud_talk_busy_state") == "consumed"
             or metadata.get("nextcloud_talk_handler_state") == "success"
         ):
-            reply_required = metadata.get("nextcloud_talk_reply_required") is True
+            reply_required = metadata.get(
+                "nextcloud_talk_text_delivery_required",
+                metadata.get("nextcloud_talk_reply_required") is True,
+            ) is True
             delivery_succeeded = self._generation_outcomes.get(key, {}).get(
                 "delivery_succeeded"
             ) is True
@@ -3077,6 +3187,35 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         return None
 
+    def _record_media_delivery_result(self, result: Optional[SendResult]) -> None:
+        if isinstance(result, SendResult) and getattr(result, "success", False) is True:
+            return
+        generation_key = self._dispatch_generation_context.get()
+        if generation_key is not None and self._generation_is_current(generation_key):
+            state = self._generation_outcomes.setdefault(generation_key, {})
+            state["media_delivery_failed"] = True
+            state["media_failure_count"] = min(
+                1024, int(state.get("media_failure_count", 0)) + 1
+            )
+
+    async def _send_tracked_media_attachment(
+        self,
+        chat_id: str,
+        local_path: str,
+        *,
+        caption: Optional[str] = None,
+        reply_to: Optional[str] = None,
+    ) -> SendResult:
+        try:
+            result = await self._send_file_attachment(
+                chat_id, local_path, caption=caption, reply_to=reply_to
+            )
+        except BaseException:
+            self._record_media_delivery_result(None)
+            raise
+        self._record_media_delivery_result(result)
+        return result
+
     async def _send_file_attachment(self, chat_id: str, local_path: str, caption: Optional[str] = None,
                                     reply_to: Optional[str] = None) -> SendResult:
         if not self._client:
@@ -3194,14 +3333,26 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         image_ref = str(image_url or "")
         if image_ref.startswith(("http://", "https://")):
             text = f"{caption}\n{image_ref}" if caption else image_ref
-            return await self.send(chat_id, text, reply_to=reply_to, metadata=metadata)
+            try:
+                result = await self.send(
+                    chat_id, text, reply_to=reply_to, metadata=metadata
+                )
+            except BaseException:
+                self._record_media_delivery_result(None)
+                raise
+            self._record_media_delivery_result(result)
+            return result
         if image_ref.startswith("file://"):
             image_ref = parse.unquote(parse.urlparse(image_ref).path)
-        return await self._send_file_attachment(chat_id, image_ref, caption=caption, reply_to=reply_to)
+        return await self._send_tracked_media_attachment(
+            chat_id, image_ref, caption=caption, reply_to=reply_to
+        )
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, **kwargs) -> SendResult:
-        return await self._send_file_attachment(chat_id, image_path, caption=caption, reply_to=reply_to)
+        return await self._send_tracked_media_attachment(
+            chat_id, image_path, caption=caption, reply_to=reply_to
+        )
 
     async def send_document(self, chat_id: str, document_path: Optional[str] = None, caption: Optional[str] = None,
                             reply_to: Optional[str] = None, **kwargs) -> SendResult:
@@ -3211,7 +3362,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return await self.send(chat_id, text, reply_to=reply_to)
         if file_path.startswith("file://"):
             file_path = parse.unquote(parse.urlparse(file_path).path)
-        return await self._send_file_attachment(chat_id, file_path, caption=caption, reply_to=reply_to)
+        return await self._send_tracked_media_attachment(
+            chat_id, file_path, caption=caption, reply_to=reply_to
+        )
+
+    async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        return await self._send_tracked_media_attachment(
+            chat_id, audio_path, caption=caption, reply_to=reply_to
+        )
+
+    async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
+                         reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        return await self._send_tracked_media_attachment(
+            chat_id, video_path, caption=caption, reply_to=reply_to
+        )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:
         room_type = "dm" if self._room_types.get(chat_id) == 1 else "group"

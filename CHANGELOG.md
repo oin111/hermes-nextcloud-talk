@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.6] - 2026-08-30
+
+### Fixed
+
+- Reconcile confirmed text-only delivery during graceful shutdown without
+  acknowledging mixed-media work before every attachment reaches a terminal
+  successful outcome.
+- Keep document, video, voice, TTS, image, and media-only delivery failures
+  generation-scoped and retryable, including replies drained later from a
+  busy-session queue.
+- Observe and sanitize cursor-commit failures raised by completion watchdogs so
+  private paths cannot leak through unhandled task tracebacks.
+- Count each failed attachment once while preserving visible failure notices.
+
 ## [0.1.5] - 2026-08-29
 
 ### Fixed

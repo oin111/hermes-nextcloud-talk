@@ -152,6 +152,242 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance._is_acknowledged("room", 902))
             self.assertFalse(instance._generation_outcomes)
 
+    async def test_document_failure_overrides_successful_text_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            document = Path(tmp) / "probe.pdf"
+            document.write_bytes(b"pdf")
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(
+                    0, result=f"text succeeded\nMEDIA:{document}"
+                )
+            )
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="document failed")
+            )
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 903}, "room")
+            await self.wait_for_background(instance)
+
+            self.assertFalse(instance._is_acknowledged("room", 903))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_audio_failure_overrides_successful_text_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            audio = Path(tmp) / "probe.mp3"
+            audio.write_bytes(b"mp3")
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(
+                    0, result=f"text succeeded\nMEDIA:{audio}"
+                )
+            )
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="audio failed")
+            )
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 905}, "room")
+            await self.wait_for_background(instance)
+
+            self.assertFalse(instance._is_acknowledged("room", 905))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_video_failure_overrides_successful_text_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            video = Path(tmp) / "probe.mp4"
+            video.write_bytes(b"mp4")
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(
+                    0, result=f"text succeeded\nMEDIA:{video}"
+                )
+            )
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="video failed")
+            )
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 906}, "room")
+            await self.wait_for_background(instance)
+
+            self.assertFalse(instance._is_acknowledged("room", 906))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_tts_failure_overrides_successful_text_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            audio = Path(tmp) / "tts.mp3"
+            audio.write_bytes(b"mp3")
+
+            async def handler(_event):
+                result = await instance.play_tts("room", str(audio))
+                self.assertFalse(result.success)
+                return "text succeeded"
+
+            instance.set_message_handler(handler)
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="tts failed")
+            )
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 907}, "room")
+            await self.wait_for_background(instance)
+
+            self.assertFalse(instance._is_acknowledged("room", 907))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_direct_image_api_failures_override_successful_text_delivery(self):
+        calls = (
+            ("send_image", lambda instance, path: instance.send_image("room", str(path))),
+            (
+                "send_image_file",
+                lambda instance, path: instance.send_image_file("room", str(path)),
+            ),
+            (
+                "send_animation",
+                lambda instance, path: instance.send_animation("room", str(path)),
+            ),
+        )
+        for offset, (name, invoke) in enumerate(calls):
+            with self.subTest(api=name), tempfile.TemporaryDirectory() as tmp:
+                instance = self.make_adapter(tmp)
+                image = Path(tmp) / ("probe.gif" if name == "send_animation" else "probe.png")
+                image.write_bytes(b"image")
+                message_id = 914 + offset
+
+                async def handler(_event):
+                    result = await invoke(instance, image)
+                    self.assertFalse(result.success)
+                    return "text succeeded"
+
+                instance.set_message_handler(handler)
+                instance.send = lambda **_kwargs: asyncio.sleep(
+                    0, result=SendResult(success=True, message_id="text")
+                )
+                instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                    0, result=SendResult(success=False, error="image failed")
+                )
+
+                await instance._handle_talk_message(
+                    {**_MESSAGE, "id": message_id}, "room"
+                )
+                await self.wait_for_background(instance)
+
+                self.assertFalse(instance._is_acknowledged("room", message_id))
+                self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_direct_url_image_api_failures_override_successful_text_delivery(self):
+        calls = (
+            (
+                "send_image",
+                lambda instance: instance.send_image(
+                    "room", "https://example.invalid/probe.png"
+                ),
+            ),
+            (
+                "send_animation",
+                lambda instance: instance.send_animation(
+                    "room", "https://example.invalid/probe.gif"
+                ),
+            ),
+        )
+        for offset, (name, invoke) in enumerate(calls):
+            with self.subTest(api=name), tempfile.TemporaryDirectory() as tmp:
+                instance = self.make_adapter(tmp)
+                message_id = 917 + offset
+                direct_image_send = True
+
+                async def send(
+                    chat_id, content, reply_to=None, metadata=None
+                ):
+                    nonlocal direct_image_send
+                    if direct_image_send:
+                        direct_image_send = False
+                        return SendResult(success=False, error="image URL failed")
+                    return SendResult(success=True, message_id="text")
+
+                async def handler(_event):
+                    result = await invoke(instance)
+                    self.assertFalse(result.success)
+                    return "text succeeded"
+
+                instance.set_message_handler(handler)
+                instance.send = send
+
+                await instance._handle_talk_message(
+                    {**_MESSAGE, "id": message_id}, "room"
+                )
+                await self.wait_for_background(instance)
+
+                self.assertFalse(instance._is_acknowledged("room", message_id))
+                self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_media_only_document_success_and_failure_gate_ack(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            document = Path(tmp) / "only.pdf"
+            document.write_bytes(b"pdf")
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(0, result=f"MEDIA:{document}")
+            )
+            media_ok = False
+
+            async def send_file(*_args, **_kwargs):
+                return SendResult(
+                    success=media_ok,
+                    message_id="media" if media_ok else None,
+                    error=None if media_ok else "document failed",
+                )
+
+            instance._send_file_attachment = send_file
+            await instance._handle_talk_message({**_MESSAGE, "id": 908}, "room")
+            await self.wait_for_background(instance)
+            self.assertFalse(instance._is_acknowledged("room", 908))
+
+            media_ok = True
+            await instance._handle_talk_message({**_MESSAGE, "id": 909}, "room")
+            await self.wait_for_background(instance)
+            self.assertTrue(instance._is_acknowledged("room", 909))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_one_failed_attachment_is_counted_once(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            document = Path(tmp) / "one.pdf"
+            document.write_bytes(b"pdf")
+            key = instance._next_generation("room", 913)
+            instance._generation_outcomes[key] = {}
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="document failed")
+            )
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="notice")
+            )
+            context_token = instance._dispatch_generation_context.set(key)
+            try:
+                result = await instance.send_document("room", str(document))
+                self.assertFalse(result.success)
+                await instance._notify_media_delivery_failure("room", str(document))
+            finally:
+                instance._dispatch_generation_context.reset(context_token)
+
+            self.assertTrue(
+                instance._generation_outcomes[key].get("media_delivery_failed")
+            )
+            self.assertEqual(
+                instance._generation_outcomes[key].get("media_failure_count"), 1
+            )
+
     async def test_cursor_stays_uncommitted_until_real_processing_success(self):
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=False):
             instance = self.make_adapter(tmp)
@@ -251,6 +487,277 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance._is_acknowledged("room", 46))
             self.assertFalse(instance._inflight_message_ids.get("room"))
             self.assertEqual(instance._completion_watchdogs, {})
+
+    async def test_queued_reply_is_acked_after_real_drain_delivery(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            calls = []
+            sends = []
+            queued = []
+
+            async def queue(event, active_session_key):
+                queued.append((event, active_session_key))
+                instance._pending_messages[active_session_key] = event
+                return True
+
+            async def handler(event):
+                calls.append(event.message_id)
+                if event.message_id == "48":
+                    first_started.set()
+                    await release_first.wait()
+                    return None
+                return "queued reply"
+
+            async def send(**kwargs):
+                sends.append(kwargs["content"])
+                return SendResult(success=True, message_id="reply")
+
+            instance.set_busy_session_handler(queue)
+            instance.set_message_handler(handler)
+            instance.send = send
+
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice"
+            )
+            session_key = build_session_key(source)
+            active_event = adapter.MessageEvent(
+                text="active",
+                user_id="alice",
+                user_name="Alice",
+                source=source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="48",
+            )
+            self.assertTrue(instance._start_session_processing(active_event, session_key))
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await instance._handle_talk_message({**_MESSAGE, "id": 49}, "room")
+            queued_event, session_key = queued[-1]
+            self.assertIs(instance._pending_messages[session_key], queued_event)
+            self.assertIs(queued_event.metadata.get(
+                "nextcloud_talk_completion_event"
+            ), instance._inflight_generations[next(
+                key for key in instance._inflight_generations if key[1] == 49
+            )].metadata["nextcloud_talk_completion_event"])
+
+            release_first.set()
+            await self.wait_for_background(instance)
+
+            self.assertEqual(calls, ["48", "49"])
+            self.assertEqual(sends, ["queued reply"])
+            self.assertTrue(instance._is_acknowledged("room", 49))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+            self.assertEqual(instance._completion_watchdogs, {})
+
+    async def test_queued_mixed_media_failure_remains_retryable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            document = Path(tmp) / "queued.pdf"
+            document.write_bytes(b"pdf")
+            first_started = asyncio.Event()
+            release_first = asyncio.Event()
+            queued = []
+            observed_contexts = []
+
+            async def queue(event, active_session_key):
+                queued.append((event, active_session_key))
+                instance._pending_messages[active_session_key] = event
+                return True
+
+            async def handler(event):
+                if event.message_id == "911":
+                    first_started.set()
+                    await release_first.wait()
+                    return None
+                observed_contexts.append(instance._dispatch_generation_context.get())
+                return f"text ok\nMEDIA:{document}"
+
+            instance.set_busy_session_handler(queue)
+            instance.set_message_handler(handler)
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = lambda *_args, **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=False, error="document failed")
+            )
+
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice"
+            )
+            session_key = build_session_key(source)
+            active_event = adapter.MessageEvent(
+                text="active",
+                user_id="alice",
+                user_name="Alice",
+                source=source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="911",
+            )
+            self.assertTrue(instance._start_session_processing(active_event, session_key))
+            await asyncio.wait_for(first_started.wait(), timeout=1)
+            await instance._handle_talk_message({**_MESSAGE, "id": 912}, "room")
+            self.assertIs(instance._pending_messages[session_key], queued[-1][0])
+
+            release_first.set()
+            await self.wait_for_background(instance)
+
+            self.assertEqual(len(observed_contexts), 1)
+            self.assertIsNotNone(observed_contexts[0])
+            self.assertFalse(instance._is_acknowledged("room", 912))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_watchdog_commits_reply_when_completion_hook_is_lost(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.02
+            original_hook = instance._run_processing_hook
+
+            async def drop_completion_hook(name, event, *args):
+                if name == "on_processing_complete" and event.message_id == "51":
+                    return None
+                return await original_hook(name, event, *args)
+
+            async def send(**_kwargs):
+                return SendResult(success=True, message_id="reply")
+
+            instance._run_processing_hook = drop_completion_hook
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(0, result="delivered reply")
+            )
+            instance.send = send
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 51}, "room")
+            await self.wait_for_background(instance)
+            await asyncio.sleep(0.08)
+
+            self.assertTrue(instance._is_acknowledged("room", 51))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+            self.assertEqual(instance._completion_watchdogs, {})
+
+    async def test_watchdog_observes_cursor_commit_error_without_leaking_path(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.processing_timeout = 0.001
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice"
+            )
+            key = instance._next_generation("room", 910)
+            event = adapter.MessageEvent(
+                text="probe",
+                user_id="alice",
+                user_name="Alice",
+                source=source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="910",
+                metadata={
+                    "nextcloud_talk_room_token": "room",
+                    "nextcloud_talk_message_id": 910,
+                    "nextcloud_talk_generation": key[2],
+                    "nextcloud_talk_handler_state": "success",
+                    "nextcloud_talk_text_delivery_required": False,
+                },
+            )
+            instance._inflight_message_ids.setdefault("room", set()).add(910)
+            instance._inflight_generations[key] = event
+            instance._generation_outcomes[key] = {}
+            private_path = "/private/secret/cursors.json"
+            instance._persist_cursors = lambda: (_ for _ in ()).throw(
+                OSError(private_path)
+            )
+
+            with self.assertLogs(adapter.logger, level="WARNING") as captured:
+                await instance._completion_watchdog(event, "room", 910, key[2])
+
+            rendered = "\n".join(captured.output)
+            self.assertNotIn(private_path, rendered)
+            self.assertIn("Could not commit confirmed processing", rendered)
+            self.assertFalse(instance._is_acknowledged("room", 910))
+            self.assertFalse(instance._inflight_message_ids.get("room"))
+
+    async def test_disconnect_commits_reply_delivered_before_completion_hook(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            hook_entered = asyncio.Event()
+            release_hook = asyncio.Event()
+            original_hook = instance._run_processing_hook
+
+            async def delayed_hook(name, event, *args):
+                if (
+                    name == "on_processing_complete"
+                    and event.message_id == "50"
+                ):
+                    hook_entered.set()
+                    await release_hook.wait()
+                return await original_hook(name, event, *args)
+
+            async def send(**_kwargs):
+                return SendResult(success=True, message_id="reply")
+
+            instance._run_processing_hook = delayed_hook
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(0, result="delivered reply")
+            )
+            instance.send = send
+            instance._running = True
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 50}, "room")
+            await asyncio.wait_for(hook_entered.wait(), timeout=1)
+            event = next(
+                event for key, event in instance._inflight_generations.items()
+                if key[1] == 50
+            )
+            key = instance._event_generation_key(event)
+            self.assertEqual(
+                instance._generation_outcomes[key].get("delivery_succeeded"), True
+            )
+            self.assertEqual(
+                event.metadata.get("nextcloud_talk_handler_state"), "success"
+            )
+
+            await instance.disconnect()
+            acknowledged_on_disconnect = instance._is_acknowledged("room", 50)
+            inflight_on_disconnect = bool(instance._inflight_message_ids.get("room"))
+            release_hook.set()
+            await self.wait_for_background(instance)
+
+            self.assertTrue(acknowledged_on_disconnect)
+            self.assertFalse(inflight_on_disconnect)
+
+    async def test_disconnect_does_not_ack_while_document_delivery_is_running(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            document = Path(tmp) / "pending.pdf"
+            document.write_bytes(b"pdf")
+            media_started = asyncio.Event()
+            release_media = asyncio.Event()
+
+            async def send_file(*_args, **_kwargs):
+                media_started.set()
+                await release_media.wait()
+                return SendResult(success=False, error="document failed")
+
+            instance.set_message_handler(
+                lambda _event: asyncio.sleep(
+                    0, result=f"text succeeded\nMEDIA:{document}"
+                )
+            )
+            instance.send = lambda **_kwargs: asyncio.sleep(
+                0, result=SendResult(success=True, message_id="text")
+            )
+            instance._send_file_attachment = send_file
+            instance._running = True
+
+            await instance._handle_talk_message({**_MESSAGE, "id": 52}, "room")
+            await asyncio.wait_for(media_started.wait(), timeout=1)
+            await instance.disconnect()
+            acknowledged_on_disconnect = instance._is_acknowledged("room", 52)
+
+            release_media.set()
+            await self.wait_for_background(instance)
+
+            self.assertFalse(acknowledged_on_disconnect)
+            self.assertFalse(instance._is_acknowledged("room", 52))
 
     async def test_watchdog_does_not_replay_during_busy_queue_handoff(self):
         with tempfile.TemporaryDirectory() as tmp:

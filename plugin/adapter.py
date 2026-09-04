@@ -46,6 +46,7 @@ import asyncio
 import base64
 import hashlib
 import ipaddress
+import inspect
 import json
 import logging
 import mimetypes
@@ -492,7 +493,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.6",
+            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.7",
         }
 
     @staticmethod
@@ -2456,7 +2457,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         assert self._client is not None
         try:
             self._ensure_ack_runtime()
-            if self._inflight_message_ids.get(room_token):
+            if (
+                self._inflight_message_ids.get(room_token)
+                and not self._room_has_pending_clarify(room_token)
+            ):
                 return
             max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
             poll_anchor = self._poll_anchor(room_token)
@@ -2544,6 +2548,84 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except Exception:
                 pass
         return False
+
+    def _room_has_pending_clarify(self, room_token: str) -> bool:
+        """Return whether an in-flight turn is blocked on a clarify response."""
+        return any(
+            key[0] == room_token
+            and self._source_has_pending_clarify(getattr(event, "source", None))
+            for key, event in self._inflight_generations.items()
+        )
+
+    def _source_session_key(self, source: Any) -> Optional[str]:
+        """Build the Hermes session key for one Talk message source."""
+        if source is None:
+            return None
+        from gateway.session import build_session_key
+
+        options = {
+            "group_sessions_per_user": self.config.extra.get(
+                "group_sessions_per_user", True
+            ),
+            "thread_sessions_per_user": self.config.extra.get(
+                "thread_sessions_per_user", False
+            ),
+        }
+        profile_resolver = getattr(self, "_session_key_profile", None)
+        if (
+            "profile" in inspect.signature(build_session_key).parameters
+            and callable(profile_resolver)
+        ):
+            options["profile"] = profile_resolver(source)
+        return build_session_key(source, **options)
+
+    def _source_matches_pending_participant(
+        self, source: Any, session_key: str
+    ) -> bool:
+        """Bind a shared group session's clarify to its oldest in-flight actor."""
+        if getattr(source, "chat_type", "") != "group":
+            return True
+        candidate_user_id = getattr(source, "user_id", None)
+        if not candidate_user_id:
+            return False
+        for event in self._inflight_generations.values():
+            owner_source = getattr(event, "source", None)
+            if owner_source is None:
+                continue
+            try:
+                owner_key = self._source_session_key(owner_source)
+            except Exception:
+                return False
+            if owner_key != session_key:
+                continue
+            owner_user_id = getattr(owner_source, "user_id", None)
+            return bool(owner_user_id) and owner_user_id == candidate_user_id
+        return False
+
+    def _source_has_pending_clarify(
+        self, source: Any, *, require_participant_owner: bool = False
+    ) -> bool:
+        """Match an unresolved clarify to one exact Hermes session source."""
+        if source is None:
+            return False
+        try:
+            from tools import clarify_gateway
+        except Exception:
+            return False
+        try:
+            session_key = self._source_session_key(source)
+        except Exception:
+            return False
+        if not session_key:
+            return False
+        entry = clarify_gateway.get_pending_for_session(
+            session_key, include_choice_prompts=True
+        )
+        if entry is None or entry.event.is_set():
+            return False
+        return not require_participant_owner or self._source_matches_pending_participant(
+            source, session_key
+        )
 
     def _finish_without_ack(
         self,
@@ -2752,10 +2834,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if self._is_acknowledged(room_token, numeric_id):
             return
         inflight = self._inflight_message_ids.setdefault(room_token, set())
-        # One dispatched turn per room. This avoids Hermes's lossy busy
-        # coalescing for ACK-bearing events; later IDs remain on Talk and
-        # are picked up after this completion releases the room.
-        if numeric_id in inflight or inflight:
+        if numeric_id in inflight:
             return
 
         raw_actor_id = msg.get("actorId")
@@ -2831,6 +2910,22 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             )
             self._commit_cursor(room_token, numeric_id)
             return
+
+        source = self.build_source(
+            chat_id=room_token,
+            chat_name=f"Nextcloud Talk {self._safe_room_token(room_token)}",
+            chat_type=chat_type,
+            user_id=actor_id or actor_name,
+            user_name=actor_name,
+        )
+        # Apply the exact-session room-lock exception before attachment I/O.
+        # A message that cannot answer the unresolved clarify must remain on
+        # Talk without triggering downloads or any other external work.
+        if inflight and not self._source_has_pending_clarify(
+            source, require_participant_owner=True
+        ):
+            return
+        await_completion = await_completion or bool(inflight)
 
         # Resolve file attachments from messageParameters.  Talk captions do
         # not necessarily contain a ``{file}`` placeholder, so carry every
@@ -2936,13 +3031,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._commit_cursor(room_token, numeric_id)
             return
 
-        source = self.build_source(
-            chat_id=room_token,
-            chat_name=f"Nextcloud Talk {self._safe_room_token(room_token)}",
-            chat_type=chat_type,
-            user_id=actor_id or actor_name,
-            user_name=actor_name,
-        )
         parent = msg.get("parent")
         reply_fields: Dict[str, Any] = {}
         if isinstance(parent, dict):

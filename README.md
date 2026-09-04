@@ -9,6 +9,7 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Native `nextcloud_talk` platform inside Hermes Gateway.
 - Standard Hermes sessions, memory, tools, approvals, slash commands, and reply routing.
 - Concurrent polling of multiple Talk rooms with independent message cursors.
+- Exact-session routing for typed `clarify` answers while a Hermes turn is blocked waiting for user input.
 - Automatic discovery of new one-to-one conversations.
 - Explicit group/public room configuration.
 - User allowlists, open-access mode, and optional bot-mention gating.
@@ -20,7 +21,7 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 
 ## Requirements
 
-- Hermes Agent with the user plugin system and `ctx.register_platform()` support.
+- Hermes Agent 0.20.6 or newer (typed `clarify` reply routing is required).
 - Python 3.11 or newer.
 - Nextcloud with the Talk/Spreed app.
 - A dedicated Nextcloud user and an app password are strongly recommended.
@@ -259,16 +260,23 @@ The bot account therefore needs normal Files/WebDAV access. Uploaded files are s
 python3 -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_packaging.py
 python3 -m unittest -q test_adapter test_packaging
 
-# Real lifecycle probes must use the environment of the installed `hermes` command.
-HERMES_PY="$(python3 -c 'import os, shutil; p=shutil.which("hermes"); print(os.path.join(os.path.dirname(os.path.realpath(p)), "python3"))')"
+# Real lifecycle probes must use the installed Hermes environment.
+HERMES_AGENT_HOME="${HERMES_AGENT_HOME:-${HERMES_HOME:-$HOME/.hermes}/hermes-agent}"
+if [ -x "$HERMES_AGENT_HOME/venv/bin/python" ]; then
+  HERMES_PY="$HERMES_AGENT_HOME/venv/bin/python"
+elif [ -x "$HERMES_AGENT_HOME/.venv/bin/python" ]; then
+  HERMES_PY="$HERMES_AGENT_HOME/.venv/bin/python"
+else
+  echo "Hermes Python environment not found under $HERMES_AGENT_HOME" >&2
+  exit 1
+fi
 "$HERMES_PY" -m unittest -q test_lifecycle_real
 python3 -m unittest -q test_packaging
 hermes plugins doctor --ci plugin/
 ```
 
-The standalone checks need only `python3`. If the shell resolution above is not
-available on your platform, activate the environment where `hermes-agent` is
-installed and run `python -m unittest -q test_lifecycle_real` there.
+The standalone checks need only `python3`. Override `HERMES_AGENT_HOME` when the
+Hermes source tree is installed outside the profile-aware default path.
 
 The suite includes credential-boundary, cursor retry, DM classification, attachment
 delivery, fallback-policy, and byte-limit regressions.
@@ -312,7 +320,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. The initial release was tested with Hermes Agent 0.20.x and Python 3.11.
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.7 is tested with Hermes Agent 0.20.6 and Python 3.11–3.13.
 
 ## License
 

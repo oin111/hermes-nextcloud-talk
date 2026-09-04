@@ -2,6 +2,14 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.7] - 2026-09-04
+
+### Fixed
+
+- Continue Talk polling while an in-flight Hermes turn is waiting for an interactive `clarify` response, allowing typed choices to reach the blocking waiter instead of deadlocking behind the room lock.
+- Match the bypass to the exact Hermes session so a prompt owned by one group participant cannot release the room lock for another participant.
+- Treat already-resolved clarify entries as non-pending, preventing a rapid second reply from being associated with the previous question before waiter cleanup completes.
+
 ## [0.1.6] - 2026-08-30
 
 ### Fixed

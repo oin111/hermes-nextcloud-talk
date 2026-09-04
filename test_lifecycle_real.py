@@ -1,4 +1,4 @@
-"""Integration probes against the installed Hermes 0.20.1 gateway lifecycle."""
+"""Integration probes against the installed Hermes 0.20.6 gateway lifecycle."""
 
 import asyncio
 import json
@@ -1090,6 +1090,244 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(retry_calls, [2])
             self.assertTrue(restarted._is_room_initialized("dm"))
             self.assertEqual(restarted._discovered_room_tokens, {"dm"})
+
+    async def test_polling_continues_for_reply_to_pending_clarify(self):
+        from tools import clarify_gateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice", user_name="Alice"
+            )
+            key = build_session_key(
+                source,
+                group_sessions_per_user=instance.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=instance.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+            owner_release = asyncio.Event()
+            owner_task = asyncio.create_task(owner_release.wait())
+            instance._active_sessions[key] = asyncio.Event()
+            instance._session_tasks[key] = owner_task
+            generation_key = ("room", 100, 1)
+            original = adapter.MessageEvent(
+                text="question trigger",
+                source=source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="100",
+                metadata={
+                    "nextcloud_talk_room_token": "room",
+                    "nextcloud_talk_message_id": 100,
+                    "nextcloud_talk_generation": 1,
+                },
+            )
+            instance._inflight_message_ids["room"] = {100}
+            instance._current_generations[("room", 100)] = 1
+            instance._inflight_generations[generation_key] = original
+            instance._generation_outcomes[generation_key] = {}
+            clarify_entry = clarify_gateway.register(
+                "clarify-101", key, "Choose deployment", ["Local", "Remote"]
+            )
+            observed = []
+
+            async def handler(event):
+                observed.append(event.text)
+                clarify_gateway.attempt_text_response_for_session(key, event.text)
+                return ""
+
+            class Client:
+                def __init__(self):
+                    self.calls = 0
+
+                async def get_messages(self, *_args, **_kwargs):
+                    self.calls += 1
+                    return [{**_MESSAGE, "id": 101, "message": "1"}]
+
+            client = Client()
+            instance._client = client
+            instance.set_message_handler(handler)
+            try:
+                await asyncio.wait_for(instance._poll_room("room"), timeout=1)
+                self.assertEqual(client.calls, 1)
+                self.assertEqual(observed, ["1"])
+                self.assertTrue(clarify_entry.event.is_set())
+                self.assertFalse(instance._source_has_pending_clarify(source))
+                self.assertTrue(instance._is_acknowledged("room", 101))
+            finally:
+                clarify_gateway.clear_session(key)
+                owner_release.set()
+                await owner_task
+
+    async def test_pending_clarify_does_not_release_room_lock_for_other_session(self):
+        from tools import clarify_gateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance.config.extra["group_sessions_per_user"] = False
+            instance._room_types["room"] = 2
+            alice_source = instance.build_source(
+                chat_id="room", chat_type="group", user_id="alice", user_name="Alice"
+            )
+            alice_key = build_session_key(
+                alice_source,
+                group_sessions_per_user=instance.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=instance.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+            original = adapter.MessageEvent(
+                text="question trigger",
+                source=alice_source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="100",
+                metadata={
+                    "nextcloud_talk_room_token": "room",
+                    "nextcloud_talk_message_id": 100,
+                    "nextcloud_talk_generation": 1,
+                },
+            )
+            instance._inflight_message_ids["room"] = {100}
+            instance._current_generations[("room", 100)] = 1
+            instance._inflight_generations[("room", 100, 1)] = original
+            instance._generation_outcomes[("room", 100, 1)] = {}
+            clarify_entry = clarify_gateway.register(
+                "clarify-alice", alice_key, "Choose deployment", ["Local", "Remote"]
+            )
+            observed = []
+            attachment_downloads = []
+
+            class Client:
+                @staticmethod
+                def _dav_url(path):
+                    return f"https://nextcloud.invalid{path}"
+
+                def _download_file(self, *_args, **_kwargs):
+                    attachment_downloads.append(True)
+                    raise AssertionError("blocked session performed attachment I/O")
+
+            instance._client = Client()
+
+            async def handler(event):
+                observed.append((event.user_id, event.text))
+                return ""
+
+            instance.set_message_handler(handler)
+            try:
+                await instance._handle_talk_message(
+                    {
+                        **_MESSAGE,
+                        "id": 101,
+                        "actorId": "bob",
+                        "actorDisplayName": "Bob",
+                        "message": "unrelated follow-up",
+                        "messageParameters": {
+                            "file": {
+                                "type": "file",
+                                "name": "payload.txt",
+                                "path": "/payload.txt",
+                                "link": "",
+                                "mimetype": "text/plain",
+                            }
+                        },
+                    },
+                    "room",
+                )
+                self.assertEqual(observed, [])
+                self.assertEqual(attachment_downloads, [])
+                self.assertFalse(clarify_entry.event.is_set())
+                self.assertEqual(instance._inflight_message_ids["room"], {100})
+                self.assertFalse(instance._is_acknowledged("room", 101))
+            finally:
+                clarify_gateway.clear_session(alice_key)
+
+    async def test_poll_batch_serializes_rapid_replies_across_two_clarifies(self):
+        from tools import clarify_gateway
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            source = instance.build_source(
+                chat_id="room", chat_type="dm", user_id="alice", user_name="Alice"
+            )
+            key = build_session_key(
+                source,
+                group_sessions_per_user=instance.config.extra.get(
+                    "group_sessions_per_user", True
+                ),
+                thread_sessions_per_user=instance.config.extra.get(
+                    "thread_sessions_per_user", False
+                ),
+            )
+            owner_release = asyncio.Event()
+            owner_task = asyncio.create_task(owner_release.wait())
+            instance._active_sessions[key] = asyncio.Event()
+            instance._session_tasks[key] = owner_task
+            original = adapter.MessageEvent(
+                text="question trigger",
+                source=source,
+                message_type=adapter.MessageType.TEXT,
+                message_id="100",
+                metadata={
+                    "nextcloud_talk_room_token": "room",
+                    "nextcloud_talk_message_id": 100,
+                    "nextcloud_talk_generation": 1,
+                },
+            )
+            instance._inflight_message_ids["room"] = {100}
+            instance._current_generations[("room", 100)] = 1
+            instance._inflight_generations[("room", 100, 1)] = original
+            instance._generation_outcomes[("room", 100, 1)] = {}
+            first = clarify_gateway.register(
+                "clarify-first", key, "First choice", ["A", "B"]
+            )
+            second = clarify_gateway.register(
+                "clarify-second", key, "Second choice", ["C", "D"]
+            )
+            observed = []
+
+            async def handler(event):
+                if event.message_id == "201":
+                    await asyncio.sleep(0.05)
+                observed.append(event.message_id)
+                clarify_gateway.attempt_text_response_for_session(key, event.text)
+                await instance.on_processing_complete(
+                    event, adapter.ProcessingOutcome.SUCCESS
+                )
+
+            async def dispatch_in_background(event):
+                task = asyncio.create_task(handler(event))
+                instance._background_tasks.add(task)
+                task.add_done_callback(instance._background_tasks.discard)
+
+            class Client:
+                async def get_messages(self, *_args, **_kwargs):
+                    return [
+                        {**_MESSAGE, "id": 201, "message": "1"},
+                        {**_MESSAGE, "id": 202, "message": "2"},
+                    ]
+
+            instance._client = Client()
+            instance.handle_message = dispatch_in_background
+            try:
+                await asyncio.wait_for(instance._poll_room("room"), timeout=1)
+                await self.wait_for_background(instance)
+                self.assertIn(observed, [["201"], ["201", "202"]])
+                self.assertEqual(first.response, "A")
+                self.assertTrue(instance._is_acknowledged("room", 201))
+                if observed == ["201"]:
+                    self.assertIsNone(second.response)
+                    self.assertFalse(instance._is_acknowledged("room", 202))
+                else:
+                    self.assertEqual(second.response, "D")
+                    self.assertTrue(instance._is_acknowledged("room", 202))
+            finally:
+                clarify_gateway.clear_session(key)
+                owner_release.set()
+                await owner_task
 
     async def test_preexisting_busy_consumed_control_paths_ack_once_and_restart_cleanly(self):
         for path_name in ("steer", "redirect", "approval", "draining-reject"):

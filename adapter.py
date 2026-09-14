@@ -71,6 +71,75 @@ except ImportError:  # Hermes 0.20.x/source-tree fallback
         configured = (os.getenv("HERMES_HOME") or "").strip()
         return Path(configured).expanduser() if configured else Path.home() / ".hermes"
 
+try:  # Hermes with the shared profile-scope-aware readers: gateway/platforms/_shared.py was added
+      # to main on 2026-09-02 (661fc669a0bb), extra_or_secret/platform_gate_env on 2026-09-13
+      # (de114b3a), and it has been shipped in released trees (e.g. 0.21.1) since.
+    from gateway.platforms._shared import get_scoped_secret as _scoped_env
+except ImportError:  # runtime without the shared readers, but with the profile secret scope itself
+    try:
+        from agent.secret_scope import UnscopedSecretError as _UnscopedSecretError
+        from agent.secret_scope import get_secret as _scope_get_secret
+
+        def _scoped_env(name, default=None, **_kwargs):
+            """The core reader's own body: an installed scope is authoritative, a scoped miss is
+            the default, and only the unscoped default-profile path falls back to os.environ.
+
+            The core's optional ``external_fallback`` rung is NOT reproduced here: this adapter
+            never passes it, and ignoring it narrows the read rather than widening it."""
+            try:
+                value = _scope_get_secret(name, None)
+            except _UnscopedSecretError:
+                value = os.getenv(name)
+            return value if value is not None else default
+    except ImportError:  # no per-profile secret scope exists at all: os.environ is the profile's own
+        def _scoped_env(name, default=None, **_kwargs):
+            return os.getenv(name, default)
+
+try:
+    from gateway.platforms._shared import extra_or_secret as _extra_or_secret
+except ImportError:  # runtimes that ship only the credential reader
+    def _extra_or_secret(extra, key, env, default="", *, blank_is_unset=True):
+        """env -> YAML ``extra[key]`` -> ``default``, mirroring the core reader."""
+        env_value = _scoped_env(env, None)
+        if env_value is not None and str(env_value).strip():
+            return env_value
+        value = (extra or {}).get(key)
+        if value is None or (blank_is_unset and isinstance(value, str) and not value.strip()):
+            return default
+        return value
+
+try:
+    from gateway.platforms._shared import platform_gate_env as _gate_env
+except ImportError:  # runtimes that ship only the credential reader
+    def _gate_env(name, default=""):
+        """Allow/deny gate read, mirroring the core reader's body: an installed scope counts only
+        while multiplexing is active, a scoped miss returns the default (never the launcher's
+        value), and values are stringified the same way."""
+        if not name:
+            return default
+        try:
+            from agent.secret_scope import current_secret_scope, is_multiplex_active
+
+            scope = current_secret_scope()
+            if scope is not None and is_multiplex_active():
+                value = scope.get(name)
+                return default if value is None else str(value).strip()
+        except Exception:  # no per-profile secret scope at all on this runtime
+            pass
+        return (os.getenv(name) or default).strip()
+
+
+def _cfg(extra: Optional[dict], env: str, key: str, default: Any = "") -> Any:
+    """This profile's setting: its own ``env`` -> its own YAML ``extra[key]`` -> ``default``.
+
+    A raw ``os.getenv`` here reads the LAUNCH process's values. Under
+    ``gateway.multiplex_profiles`` those belong to the default profile, so a secondary
+    profile's adapter connected with the default profile's bot credentials and room list
+    and answered in the default profile's rooms under the default profile's account.
+    """
+    return _extra_or_secret(extra, key, env, default)
+
+
 from gateway.config import Platform, PlatformConfig
 from gateway.platforms.base import (
     BasePlatformAdapter,
@@ -81,6 +150,33 @@ from gateway.platforms.base import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+_RELEASED_VERSION = "0.1.8"
+_VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
+
+
+def _plugin_version() -> str:
+    """The plugin version reported to the Talk server, taken from the manifest beside this file so
+    it cannot drift from plugin.yaml. Anything unreadable or implausible (missing, a directory, a
+    FIFO, invalid UTF-8, a stray comment, a non-header-safe character) falls back to the released
+    constant instead of failing the plugin import or poisoning every request's User-Agent."""
+    manifest = Path(__file__).with_name("plugin.yaml")
+    try:
+        if not manifest.is_file():  # a directory, a FIFO (read_text would block forever), a dangling link
+            return _RELEASED_VERSION
+        text = manifest.read_text(encoding="utf-8")
+    except (OSError, ValueError):  # unreadable, or not valid UTF-8
+        return _RELEASED_VERSION
+    for line in text.splitlines():
+        if line.startswith("version:"):
+            value = line.split(":", 1)[1].split("#", 1)[0].strip().strip("'\"")
+            if _VERSION_RE.fullmatch(value):
+                return value
+    return _RELEASED_VERSION
+
+
+_PLUGIN_VERSION = _plugin_version()
 
 _DEFAULT_POLL_TIMEOUT = 30
 _DEFAULT_MAX_MESSAGE_LENGTH = 32000
@@ -426,8 +522,8 @@ def _parse_room_tokens(value: Optional[str]) -> List[str]:
 
 def _resolve_room_tokens() -> List[str]:
     """Resolve the full set of room tokens from env vars."""
-    tokens = _parse_room_tokens(os.getenv("NEXTCLOUD_TALK_ROOM_TOKENS", ""))
-    legacy = _parse_room_tokens(os.getenv("NEXTCLOUD_TALK_ROOM_TOKEN", ""))
+    tokens = _parse_room_tokens(_scoped_env("NEXTCLOUD_TALK_ROOM_TOKENS", "") or "")
+    legacy = _parse_room_tokens(_scoped_env("NEXTCLOUD_TALK_ROOM_TOKEN", "") or "")
     # Merge: legacy token first if not already in tokens list
     for t in legacy:
         if t not in tokens:
@@ -466,7 +562,7 @@ class NextcloudTalkClient:
                  max_cache_bytes: int = _DEFAULT_MAX_CACHE_BYTES,
                  max_cache_files: int = _DEFAULT_MAX_CACHE_FILES):
         if not _secure_base_url(
-            base_url, _truthy(os.getenv("NEXTCLOUD_TALK_ALLOW_INSECURE_HTTP"), False)
+            base_url, _truthy(_scoped_env("NEXTCLOUD_TALK_ALLOW_INSECURE_HTTP"), False)
         ):
             raise ValueError("NEXTCLOUD_TALK_URL must use HTTPS (HTTP is limited to loopback or explicit opt-in)")
         self.base_url = base_url.rstrip("/")
@@ -493,7 +589,7 @@ class NextcloudTalkClient:
             "Authorization": f"Basic {token}",
             "OCS-APIRequest": "true",
             "Accept": "application/json",
-            "User-Agent": "Hermes-Agent-Nextcloud-Talk/0.1.7",
+            "User-Agent": f"Hermes-Agent-Nextcloud-Talk/{_PLUGIN_VERSION}",
         }
 
     @staticmethod
@@ -1376,43 +1472,40 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         super().__init__(config, Platform("nextcloud_talk"))
         extra = getattr(config, "extra", {}) or {}
 
-        self.base_url = os.getenv("NEXTCLOUD_TALK_URL") or extra.get("url", "")
-        self.username = os.getenv("NEXTCLOUD_TALK_USERNAME") or extra.get("username", "")
-        self.password = os.getenv("NEXTCLOUD_TALK_PASSWORD") or extra.get("password", "")
-        self.bot_name = os.getenv("NEXTCLOUD_TALK_BOT_NAME") or extra.get("bot_name", "Hermes")
-        self.poll_timeout = int(os.getenv("NEXTCLOUD_TALK_POLL_TIMEOUT") or extra.get("poll_timeout", _DEFAULT_POLL_TIMEOUT))
-        self.require_mention = _truthy(os.getenv("NEXTCLOUD_TALK_REQUIRE_MENTION"), bool(extra.get("require_mention", False)))
+        self.base_url = _cfg(extra, "NEXTCLOUD_TALK_URL", "url", "")
+        self.username = _cfg(extra, "NEXTCLOUD_TALK_USERNAME", "username", "")
+        self.password = _cfg(extra, "NEXTCLOUD_TALK_PASSWORD", "password", "")
+        self.bot_name = _cfg(extra, "NEXTCLOUD_TALK_BOT_NAME", "bot_name", "Hermes")
+        self.poll_timeout = int(_cfg(extra, "NEXTCLOUD_TALK_POLL_TIMEOUT", "poll_timeout", _DEFAULT_POLL_TIMEOUT))
+        self.require_mention = _truthy(
+            _cfg(extra, "NEXTCLOUD_TALK_REQUIRE_MENTION", "require_mention", None), False
+        )
         # Legacy PROCESS_HISTORY=true means unlimited first-run backfill.  The
         # safe default is a documented bounded backlog, never "skip to latest".
-        self.process_history = _truthy(os.getenv("NEXTCLOUD_TALK_PROCESS_HISTORY"), bool(extra.get("process_history", False)))
-        backlog_value = os.getenv("NEXTCLOUD_TALK_INITIAL_BACKLOG_LIMIT") or extra.get(
-            "initial_backlog_limit", _DEFAULT_INITIAL_BACKLOG
+        self.process_history = _truthy(
+            _cfg(extra, "NEXTCLOUD_TALK_PROCESS_HISTORY", "process_history", None), False
         )
+        backlog_value = _cfg(extra, "NEXTCLOUD_TALK_INITIAL_BACKLOG_LIMIT", "initial_backlog_limit", _DEFAULT_INITIAL_BACKLOG)
         self.initial_backlog_limit: Optional[int] = None if self.process_history else max(0, int(backlog_value))
-        self.upload_folder = os.getenv("NEXTCLOUD_TALK_UPLOAD_FOLDER") or extra.get("upload_folder", "/Hermes Uploads")
-        self.max_download_bytes = int(os.getenv("NEXTCLOUD_TALK_MAX_INBOUND_FILE_BYTES") or extra.get("max_inbound_file_bytes", _DEFAULT_MAX_DOWNLOAD_BYTES))
-        self.max_upload_bytes = int(os.getenv("NEXTCLOUD_TALK_MAX_OUTBOUND_FILE_BYTES") or extra.get("max_outbound_file_bytes", _DEFAULT_MAX_UPLOAD_BYTES))
+        self.upload_folder = _cfg(extra, "NEXTCLOUD_TALK_UPLOAD_FOLDER", "upload_folder", "/Hermes Uploads")
+        self.max_download_bytes = int(_cfg(extra, "NEXTCLOUD_TALK_MAX_INBOUND_FILE_BYTES", "max_inbound_file_bytes", _DEFAULT_MAX_DOWNLOAD_BYTES))
+        self.max_upload_bytes = int(_cfg(extra, "NEXTCLOUD_TALK_MAX_OUTBOUND_FILE_BYTES", "max_outbound_file_bytes", _DEFAULT_MAX_UPLOAD_BYTES))
         self.max_attachments_per_message = max(0, int(
-            os.getenv("NEXTCLOUD_TALK_MAX_ATTACHMENTS_PER_MESSAGE")
-            or extra.get("max_attachments_per_message", _DEFAULT_MAX_ATTACHMENTS_PER_MESSAGE)
+            _cfg(extra, "NEXTCLOUD_TALK_MAX_ATTACHMENTS_PER_MESSAGE", "max_attachments_per_message", _DEFAULT_MAX_ATTACHMENTS_PER_MESSAGE)
         ))
         self.max_attachment_total_bytes = max(0, int(
-            os.getenv("NEXTCLOUD_TALK_MAX_ATTACHMENT_TOTAL_BYTES")
-            or extra.get("max_attachment_total_bytes", _DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES)
+            _cfg(extra, "NEXTCLOUD_TALK_MAX_ATTACHMENT_TOTAL_BYTES", "max_attachment_total_bytes", _DEFAULT_MAX_ATTACHMENT_TOTAL_BYTES)
         ))
         self.max_cache_bytes = max(0, int(
-            os.getenv("NEXTCLOUD_TALK_MAX_CACHE_BYTES")
-            or extra.get("max_cache_bytes", _DEFAULT_MAX_CACHE_BYTES)
+            _cfg(extra, "NEXTCLOUD_TALK_MAX_CACHE_BYTES", "max_cache_bytes", _DEFAULT_MAX_CACHE_BYTES)
         ))
         self.max_cache_files = max(0, int(
-            os.getenv("NEXTCLOUD_TALK_MAX_CACHE_FILES")
-            or extra.get("max_cache_files", _DEFAULT_MAX_CACHE_FILES)
+            _cfg(extra, "NEXTCLOUD_TALK_MAX_CACHE_FILES", "max_cache_files", _DEFAULT_MAX_CACHE_FILES)
         ))
-        self.max_json_bytes = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_JSON_BYTES") or extra.get("max_json_bytes", _DEFAULT_MAX_JSON_BYTES)))
-        self.max_body_bytes = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_BODY_BYTES") or extra.get("max_body_bytes", _DEFAULT_MAX_BODY_BYTES)))
+        self.max_json_bytes = max(1, int(_cfg(extra, "NEXTCLOUD_TALK_MAX_JSON_BYTES", "max_json_bytes", _DEFAULT_MAX_JSON_BYTES)))
+        self.max_body_bytes = max(1, int(_cfg(extra, "NEXTCLOUD_TALK_MAX_BODY_BYTES", "max_body_bytes", _DEFAULT_MAX_BODY_BYTES)))
         configured_poll_batch = max(1, int(
-            os.getenv("NEXTCLOUD_TALK_MAX_POLL_BATCH")
-            or extra.get("max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
+            _cfg(extra, "NEXTCLOUD_TALK_MAX_POLL_BATCH", "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
         ))
         self.max_poll_batch = _normalize_poll_batch(configured_poll_batch)
         if configured_poll_batch > _MAX_TALK_POLL_BATCH:
@@ -1420,25 +1513,25 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 "[nextcloud_talk] Poll batch %d exceeds Talk's protocol limit; clamping to %d",
                 configured_poll_batch, _MAX_TALK_POLL_BATCH,
             )
-        self.max_rooms = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_ROOMS") or extra.get("max_rooms", _DEFAULT_MAX_ROOMS)))
-        configured_ack_rooms = os.getenv("NEXTCLOUD_TALK_MAX_ACK_ROOMS") or extra.get("max_ack_rooms")
+        self.max_rooms = max(1, int(_cfg(extra, "NEXTCLOUD_TALK_MAX_ROOMS", "max_rooms", _DEFAULT_MAX_ROOMS)))
+        configured_ack_rooms = _cfg(extra, "NEXTCLOUD_TALK_MAX_ACK_ROOMS", "max_ack_rooms", None)
         self.max_ack_rooms = max(
             self.max_rooms,
             int(configured_ack_rooms) if configured_ack_rooms is not None
             else self.max_rooms * _ACK_ROOM_LIMIT_MULTIPLIER,
         )
-        self.max_backlog_messages = max(1, int(os.getenv("NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES") or extra.get("max_backlog_messages", _DEFAULT_MAX_BACKLOG_MESSAGES)))
+        self.max_backlog_messages = max(1, int(_cfg(extra, "NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES", "max_backlog_messages", _DEFAULT_MAX_BACKLOG_MESSAGES)))
         self.allow_public_share_fallback = _truthy(
-            os.getenv("NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK"),
-            bool(extra.get("allow_public_share_fallback", False)),
+            _cfg(extra, "NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK", "allow_public_share_fallback", None),
+            False,
         )
         self.auto_discover_rooms = _truthy(
-            os.getenv("NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS"),
-            bool(extra.get("auto_discover_rooms", True)),
+            _cfg(extra, "NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS", "auto_discover_rooms", None),
+            True,
         )
         self.discovery_interval = max(
             5,
-            int(os.getenv("NEXTCLOUD_TALK_DISCOVERY_INTERVAL") or extra.get("discovery_interval", 30)),
+            int(_cfg(extra, "NEXTCLOUD_TALK_DISCOVERY_INTERVAL", "discovery_interval", 30)),
         )
 
         # Resolve room tokens: support both legacy NEXTCLOUD_TALK_ROOM_TOKEN (single)
@@ -1457,7 +1550,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._discovered_room_tokens: Set[str] = set()
         self._room_types: Dict[str, int] = {}
 
-        allowed_env = os.getenv("NEXTCLOUD_TALK_ALLOWED_USERS", "")
+        # Allow/deny gates go through the core's profile-isolated reader: under a multiplexed
+        # secondary profile a scoped miss must return the default, never the launcher's allowlist.
+        allowed_env = _gate_env("NEXTCLOUD_TALK_ALLOWED_USERS", "")
         allowed_cfg = extra.get("allow_from", [])
         if allowed_env:
             self.allowed_users = _csv_set(allowed_env)
@@ -1476,9 +1571,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             }
         else:
             self.group_allowed_users = _csv_set(str(group_allowed_cfg or ""))
-        self.allow_all = _truthy(os.getenv("NEXTCLOUD_TALK_ALLOW_ALL_USERS"), False)
+        self.allow_all = _truthy(_gate_env("NEXTCLOUD_TALK_ALLOW_ALL_USERS", ""), False)
 
-        max_len = os.getenv("NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH") or extra.get("max_message_length")
+        max_len = _cfg(extra, "NEXTCLOUD_TALK_MAX_MESSAGE_LENGTH", "max_message_length", None)
         self.max_message_length = int(max_len or _DEFAULT_MAX_MESSAGE_LENGTH)
 
         self._client: Optional[NextcloudTalkClient] = None
@@ -1499,16 +1594,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
         self._completion_watchdogs: Dict[tuple[str, int, int], asyncio.Task] = {}
         self.processing_timeout = max(1.0, float(
-            os.getenv("NEXTCLOUD_TALK_PROCESSING_TIMEOUT")
-            or extra.get("processing_timeout", _DEFAULT_PROCESSING_TIMEOUT)
+            _cfg(extra, "NEXTCLOUD_TALK_PROCESSING_TIMEOUT", "processing_timeout", _DEFAULT_PROCESSING_TIMEOUT)
         ))
         self.ack_retention_count = max(32, int(
-            os.getenv("NEXTCLOUD_TALK_ACK_RETENTION_COUNT")
-            or extra.get("ack_retention_count", _DEFAULT_ACK_RETENTION_COUNT)
+            _cfg(extra, "NEXTCLOUD_TALK_ACK_RETENTION_COUNT", "ack_retention_count", _DEFAULT_ACK_RETENTION_COUNT)
         ))
         configured_ack_overlap = int(
-            os.getenv("NEXTCLOUD_TALK_ACK_OVERLAP_IDS")
-            or extra.get("ack_overlap_ids", _DEFAULT_ACK_OVERLAP_IDS)
+            _cfg(extra, "NEXTCLOUD_TALK_ACK_OVERLAP_IDS", "ack_overlap_ids", _DEFAULT_ACK_OVERLAP_IDS)
         )
         self.ack_overlap_ids = _normalize_ack_overlap(
             configured_ack_overlap, self.max_poll_batch
@@ -3474,11 +3566,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 def _configured_values(config: Optional[PlatformConfig] = None) -> tuple[str, str, str, str]:
     extra = getattr(config, "extra", {}) or {}
     return (
-        os.getenv("NEXTCLOUD_TALK_URL") or extra.get("url", ""),
-        os.getenv("NEXTCLOUD_TALK_USERNAME") or extra.get("username", ""),
-        os.getenv("NEXTCLOUD_TALK_PASSWORD") or extra.get("password", ""),
-        os.getenv("NEXTCLOUD_TALK_ROOM_TOKENS") or extra.get("room_tokens", "")
-        or os.getenv("NEXTCLOUD_TALK_ROOM_TOKEN") or extra.get("room_token", ""),
+        _cfg(extra, "NEXTCLOUD_TALK_URL", "url", ""),
+        _cfg(extra, "NEXTCLOUD_TALK_USERNAME", "username", ""),
+        _cfg(extra, "NEXTCLOUD_TALK_PASSWORD", "password", ""),
+        _cfg(extra, "NEXTCLOUD_TALK_ROOM_TOKENS", "room_tokens", "")
+        or _cfg(extra, "NEXTCLOUD_TALK_ROOM_TOKEN", "room_token", ""),
     )
 
 
@@ -3490,12 +3582,12 @@ def validate_config(config) -> bool:
     url, username, password, tokens = _configured_values(config)
     extra = getattr(config, "extra", {}) or {}
     allow_insecure = _truthy(
-        os.getenv("NEXTCLOUD_TALK_ALLOW_INSECURE_HTTP"),
-        bool(extra.get("allow_insecure_http", False)),
+        _cfg(extra, "NEXTCLOUD_TALK_ALLOW_INSECURE_HTTP", "allow_insecure_http", None),
+        False,
     )
     auto_discover = _truthy(
-        os.getenv("NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS"),
-        bool(extra.get("auto_discover_rooms", True)),
+        _cfg(extra, "NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS", "auto_discover_rooms", None),
+        True,
     )
     return bool(
         url and _secure_base_url(url, allow_insecure)

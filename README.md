@@ -215,6 +215,32 @@ version or otherwise has an envelope shape is preserved byte-for-byte, persisten
 blocked, and no envelope field is reinterpreted as a room. Recover such a file only
 after upgrading to a compatible plugin or explicitly moving it aside.
 
+### Multiple profiles under one gateway (multiplex)
+
+With `gateway.multiplex_profiles: true` a single Hermes gateway process serves several
+profiles. Every `NEXTCLOUD_TALK_*` setting this adapter reads resolves from the **owning
+profile's** secret scope, so each profile's Talk lane uses its own credentials, room list and
+allowlist:
+
+- a secondary profile never inherits the default profile's bot account, rooms, or allowlist;
+- a secondary profile with no Talk credentials of its own stays unconfigured instead of
+  connecting as another profile's bot;
+- the profile's own `config.yaml` `extra` block is the fallback when its `.env` has no value.
+
+This relies on the shared scoped readers in `gateway.platforms._shared` (`get_scoped_secret`,
+added to `main` on 2026-09-02 in `661fc669a0bb`; `extra_or_secret` and `platform_gate_env` since
+`de114b3a`, 2026-09-13 UTC, env-first since `3dedb71f2f`). Any runtime where that module is absent
+or still lacks those two readers — released 0.20.x, and also 0.21.1/0.21.2 trees that ship only
+`get_scoped_secret` — gets the same isolation through a compatibility shim that inlines the core
+readers on top of `agent.secret_scope`. Only on runtimes with no per-profile secret scope at all
+does the adapter fall back to plain `os.environ` — there a secondary profile's lane would read the
+launcher's values, so keep Talk on the default profile only.
+
+A blank env value counts as unset: the profile's own `config.yaml` `extra` key (or the setting
+default) applies instead. The pre-0.1.8 reader treated a present-but-blank `NEXTCLOUD_TALK_*`
+variable as a hard `false`/empty value, which could silently disable room discovery or the
+mention requirement.
+
 ## How media works
 
 ### Inbound
@@ -320,7 +346,8 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.7 is tested with Hermes Agent 0.20.6 and Python 3.11–3.13.
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.8 is tested with Python 3.11–3.13. Profile isolation under
+`gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License
 

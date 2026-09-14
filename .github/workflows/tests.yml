@@ -20,17 +20,50 @@ jobs:
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
           python-version: ${{ matrix.python-version }}
-      - name: Install tested Hermes Agent 0.20.6 runtime
+      - name: Install Hermes runtime with the shared scoped-secret readers
+        run: |
+          git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "${RUNNER_TEMP}/hermes-agent"
+          # Earliest main commit whose extra_or_secret is env-first, matching the modern contract
+          # ("explicit env -> own YAML -> default"); de114b3a (2026-09-13) still resolved YAML first.
+          git -C "${RUNNER_TEMP}/hermes-agent" checkout 3dedb71f2f4f280707a52aed1a83f56a9214ab18
+          python -m pip install -e "${RUNNER_TEMP}/hermes-agent"
+      - name: Compile
+        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_profile_scope.py test_compat_shim.py test_packaging.py
+      - name: Combined unit, real lifecycle, profile-scope and compat-shim tests
+        run: python -m unittest -q test_adapter test_lifecycle_real test_profile_scope test_compat_shim test_packaging
+      - name: Plugin doctor
+        run: hermes plugins doctor --ci plugin/
+
+  # The adapter must keep working on the runtime this plugin was previously tested against
+  # (0.20.6 = tag v2026.8.27). That runtime DOES ship agent.secret_scope but NOT
+  # gateway/platforms/_shared.py, so the compat shim's inlined-reader branch is what runs there —
+  # test_compat_shim asserts it is scope-aware, and test_profile_scope reports as skipped.
+  compat-runtime:
+    runs-on: ubuntu-latest
+    steps:
+      # actions/checkout v4.2.2
+      - uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683
+      # actions/setup-python v5.6.0
+      - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
+        with:
+          python-version: "3.11"
+      - name: Install previously tested Hermes Agent 0.20.6 runtime
         run: |
           git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "${RUNNER_TEMP}/hermes-agent"
           git -C "${RUNNER_TEMP}/hermes-agent" checkout 5fc308a70719a83cccdbba4c0e39c23f5a8239d5
           python -m pip install -e "${RUNNER_TEMP}/hermes-agent"
-      - name: Compile
-        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_packaging.py
-      - name: Combined unit and real lifecycle tests
-        run: python -m unittest -q test_adapter test_lifecycle_real test_packaging
-      - name: Plugin doctor
-        run: hermes plugins doctor --ci plugin/
+      - name: Legacy-runtime unit tests
+        run: python -m unittest -q test_adapter test_packaging
+      - name: Shim is scope-aware on this runtime
+        # No module poisoning needed here: this runtime genuinely lacks gateway/platforms/_shared.py.
+        run: python -m unittest -q test_compat_shim
+      - name: Profile-scope module skips instead of failing
+        # Discovery form required: `python -m unittest test_profile_scope` lets the module-level
+        # SkipTest escape loadTestsFromName as a traceback; discovery reports "OK (skipped=1)".
+        run: |
+          set -o pipefail
+          python -m unittest discover -s . -p "test_profile_scope.py" 2>&1 | tee "${RUNNER_TEMP}/scope.log"
+          grep -q "OK (skipped=" "${RUNNER_TEMP}/scope.log"
 
   security-scan:
     runs-on: ubuntu-latest

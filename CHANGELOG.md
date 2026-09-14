@@ -2,6 +2,53 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.8] - 2026-09-14
+
+### Fixed
+
+- Read every adapter setting through the profile-scoped readers
+  (`gateway.platforms._shared.get_scoped_secret` / `extra_or_secret` / `platform_gate_env`)
+  instead of a raw `os.getenv`. Under `gateway.multiplex_profiles` a secondary profile's lane
+  inherited the LAUNCHER's values — the default profile's bot credentials, room list and
+  allowlist — so it connected as the default profile's bot and answered in that profile's
+  rooms. A secondary lane now uses its own credentials, its own rooms and its own allowlist,
+  and a secondary profile without Talk credentials of its own stays unconfigured
+  (`validate_config` is scope-aware, and the core's `platform_registry.create_adapter`
+  consults it) instead of borrowing another profile's.
+- Keep profile isolation on runtimes without `gateway.platforms._shared`: the compatibility
+  shim now inlines the core reader on top of `agent.secret_scope` (Hermes 0.20.x). Only a
+  runtime with no per-profile secret scope at all falls back to plain `os.environ`, which is
+  documented as unsupported for a secondary lane.
+- Report the real plugin version in the Talk client `User-Agent` (it was frozen at 0.1.7);
+  it is now derived from the neighbouring `plugin.yaml`, with hardening so a missing, unreadable,
+  non-UTF-8, comment-laden or implausible manifest falls back to the released constant instead of
+  failing the plugin import or poisoning every request header.
+
+### Changed
+
+- A present-but-blank `NEXTCLOUD_TALK_*` value now counts as UNSET, matching the core
+  contract: the profile's own `config.yaml` `extra` key (or the setting default) applies.
+  The previous reader treated a blank value as a hard `false`/empty, which could silently
+  disable room discovery (`NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS=`) or the mention requirement
+  (`NEXTCLOUD_TALK_REQUIRE_MENTION=`). Blank YAML strings are likewise unset.
+
+### Added
+
+- `test_profile_scope.py`: real-core probes for secondary-profile isolation, the fail-closed
+  uncredentialed case (through `platform_registry.create_adapter` on a dedicated probe
+  registration that carries THIS module's `validate_config`, so the gate under test can never be
+  a foreign registration), default and single-profile env semantics, the blank-env rule, the
+  isolation path on a runtime with `agent.secret_scope` but no shared readers, and the legacy
+  fallback. An anti-regression probe spies on both `os.getenv` and direct `os.environ` lookups.
+- `test_compat_shim.py`: probes the compat shim's own branch (scope-aware credentials,
+  fail-closed without profile credentials, unscoped default lane) without importing
+  `gateway.platforms._shared`, so the compatibility CI job exercises it on the real 0.20.6
+  runtime instead of skipping.
+- CI: the main job runs against the earliest Hermes `main` commit whose `extra_or_secret` is
+  env-first (`3dedb71f2f`); the compatibility job covers the previously tested 0.20.6 runtime,
+  where the shim probes run for real and the profile-scope module reports as skipped
+  (discovery invocation, `pipefail`, exact `OK (skipped=` gate).
+
 ## [0.1.7] - 2026-09-04
 
 ### Fixed

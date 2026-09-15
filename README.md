@@ -233,8 +233,8 @@ added to `main` on 2026-09-02 in `661fc669a0bb`; `extra_or_secret` and `platform
 or still lacks those two readers — released 0.20.x, and also 0.21.1/0.21.2 trees that ship only
 `get_scoped_secret` — gets the same isolation through a compatibility shim that inlines the core
 readers on top of `agent.secret_scope`. Only on runtimes with no per-profile secret scope at all
-does the adapter fall back to plain `os.environ` — there a secondary profile's lane would read the
-launcher's values, so keep Talk on the default profile only.
+does the adapter fall back to the plain process environment — there a secondary profile's lane
+would read the launcher's values, so keep Talk on the default profile only.
 
 A blank env value counts as unset: the profile's own `config.yaml` `extra` key (or the setting
 default) applies instead. The pre-0.1.8 reader treated a present-but-blank `NEXTCLOUD_TALK_*`

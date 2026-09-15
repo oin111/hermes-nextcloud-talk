@@ -112,7 +112,7 @@ class SecurityDownloadTests(unittest.TestCase):
         bad = [
             "https://bot@cloud.example:8443/file", "http://cloud.example:8443/file",
             "https://other.example:8443/file", "https://cloud.example/file",
-            "file:///etc/passwd",
+            "file:///tmp/attachment.txt",
         ]
         with tempfile.TemporaryDirectory() as tmp, patch.object(self.client, "_open_authenticated") as opened:
             for url in bad:

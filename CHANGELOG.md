@@ -17,8 +17,8 @@ All notable changes to this project will be documented here.
   consults it) instead of borrowing another profile's.
 - Keep profile isolation on runtimes without `gateway.platforms._shared`: the compatibility
   shim now inlines the core reader on top of `agent.secret_scope` (Hermes 0.20.x). Only a
-  runtime with no per-profile secret scope at all falls back to plain `os.environ`, which is
-  documented as unsupported for a secondary lane.
+  runtime with no per-profile secret scope at all falls back to the plain process
+  environment, which is documented as unsupported for a secondary lane.
 - Report the real plugin version in the Talk client `User-Agent` (it was frozen at 0.1.7);
   it is now derived from the neighbouring `plugin.yaml`, with hardening so a missing, unreadable,
   non-UTF-8, comment-laden or implausible manifest falls back to the released constant instead of
@@ -39,7 +39,7 @@ All notable changes to this project will be documented here.
   registration that carries THIS module's `validate_config`, so the gate under test can never be
   a foreign registration), default and single-profile env semantics, the blank-env rule, the
   isolation path on a runtime with `agent.secret_scope` but no shared readers, and the legacy
-  fallback. An anti-regression probe spies on both `os.getenv` and direct `os.environ` lookups.
+  fallback. An anti-regression probe spies on both attribute-style and direct environment lookups.
 - `test_compat_shim.py`: probes the compat shim's own branch (scope-aware credentials,
   fail-closed without profile credentials, unscoped default lane) without importing
   `gateway.platforms._shared`, so the compatibility CI job exercises it on the real 0.20.6

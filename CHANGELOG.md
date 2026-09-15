@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.10] - 2026-09-15
+
+### Fixed
+
+- The launcher-environment probes in `test_compat_shim.py` and `test_profile_scope.py` are now
+  hermetic. They seeded only the keys their own fixtures named, while importing the adapter pulls in
+  the core modules that hydrate the active profile's env file into the process environment: on a host
+  whose profile defines a Talk key the fixture does not name (the singular room-token variable, for
+  instance) the real settings of that host leaked into the assertions, and the unscoped default-lane
+  probe compared a two-element token list against its single fixture value. CI never saw it because
+  its runner unsets credential variables; the documented `python3 -m unittest` run does not. The
+  helper drops every `NEXTCLOUD_TALK*` key before applying the fixture's launcher values and
+  restores the host's values afterwards, so the probes depend only on the fixture.
+
 ## [0.1.9] - 2026-09-15
 
 ### Fixed

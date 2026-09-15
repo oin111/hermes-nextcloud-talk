@@ -152,7 +152,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.9"
+_RELEASED_VERSION = "0.1.10"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 

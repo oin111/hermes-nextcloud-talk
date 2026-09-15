@@ -76,11 +76,18 @@ SECONDARY_ENV = {
 
 @contextlib.contextmanager
 def _launcher_env():
-    saved = {key: os.environ.get(key) for key in set(LAUNCHER_ENV) | set(SECONDARY_ENV)}
+    """``os.environ`` as the launcher sees it, with the host's own ``NEXTCLOUD_TALK*`` keys dropped.
+
+    Importing the adapter pulls in the core modules that hydrate the active profile's env file into
+    the process environment, so a live host hands this probe real Talk settings for keys the fixture
+    does not name (the singular ``NEXTCLOUD_TALK_ROOM_TOKEN``, say). Confining the environment to the
+    fixture's own keys is what keeps the assertions independent of where the suite runs.
+    """
+    keys = {key for key in os.environ if key.startswith("NEXTCLOUD_TALK")} | set(LAUNCHER_ENV) | set(SECONDARY_ENV)
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
     os.environ.update(LAUNCHER_ENV)
-    for key in SECONDARY_ENV:
-        if key not in LAUNCHER_ENV:
-            os.environ.pop(key, None)
     try:
         yield
     finally:

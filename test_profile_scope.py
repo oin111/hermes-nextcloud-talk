@@ -133,14 +133,20 @@ def _write_env(profile_home: Path, values: dict) -> None:
 
 @contextlib.contextmanager
 def _launcher_env():
-    """``os.environ`` as the multiplexer's launch process sees it: the DEFAULT profile's values."""
-    saved = {key: os.environ.get(key) for key in set(LAUNCHER_ENV) | set(SECONDARY_ENV)}
+    """``os.environ`` as the multiplexer's launch process sees it: the DEFAULT profile's values.
+
+    The host's own ``NEXTCLOUD_TALK*`` keys are dropped first: importing the adapter hydrates the
+    active profile's env file into the process environment, so a key the fixture does not name (the
+    singular ``NEXTCLOUD_TALK_ROOM_TOKEN``, say) would otherwise leak the real Talk settings of
+    whichever host runs this suite into the default-lane probes.
+    """
+    keys = {key for key in os.environ if key.startswith("NEXTCLOUD_TALK")} | set(LAUNCHER_ENV) | set(SECONDARY_ENV)
+    saved = {key: os.environ.get(key) for key in keys}
+    for key in keys:
+        os.environ.pop(key, None)
     os.environ.update(LAUNCHER_ENV)
     # The secondary's own values are NOT in the launcher's environment — that is the whole point:
     # keys that only the secondary's .env defines are simply absent here.
-    for key in SECONDARY_ENV:
-        if key not in LAUNCHER_ENV:
-            os.environ.pop(key, None)
     try:
         yield
     finally:

@@ -28,9 +28,9 @@ jobs:
           git -C "${RUNNER_TEMP}/hermes-agent" checkout 3dedb71f2f4f280707a52aed1a83f56a9214ab18
           python -m pip install -e "${RUNNER_TEMP}/hermes-agent"
       - name: Compile
-        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_profile_scope.py test_compat_shim.py test_packaging.py
+        run: python -m py_compile adapter.py test_adapter.py test_lifecycle_real.py test_profile_scope.py test_compat_shim.py test_packaging.py test_startup_real.py
       - name: Combined unit, real lifecycle, profile-scope and compat-shim tests
-        run: python -m unittest -q test_adapter test_lifecycle_real test_profile_scope test_compat_shim test_packaging
+        run: python -m unittest -q test_adapter test_lifecycle_real test_profile_scope test_compat_shim test_packaging test_startup_real
       - name: Plugin doctor
         run: hermes plugins doctor --ci plugin/
 

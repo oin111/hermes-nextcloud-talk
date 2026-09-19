@@ -194,6 +194,10 @@ outcome, so it remains retryable.
 Completed inbound attachments are bounded profile-wide by both payload bytes and file
 count. Quota eviction is serialized, deterministic oldest-first, and skips active
 downloads; completed data/manifest pairs are removed together.
+Connection readiness requires room metadata, not completion of agent replies. Bounded
+backlogs run in one owned background task per room; already initialized rooms continue
+polling. Failed initialization retries with backoff. Removing a discovered room stops
+further backlog intake while already accepted handlers retain completion ownership.
 Room initialization completion is persisted separately from successful IDs and is set
 only after the entire bounded startup backlog succeeds; partial runs retry only their
 failed/unprocessed IDs after refresh or restart. Legacy scalar cursor JSON is migrated
@@ -346,7 +350,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.10 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.11 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

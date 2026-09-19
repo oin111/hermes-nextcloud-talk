@@ -2,6 +2,23 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.11] - 2026-09-19 (UTC)
+
+### Fixed
+
+- Connect after room metadata validation without waiting for backlog replies. New-room
+  history now runs in owned background tasks, preventing gateway connect timeouts and
+  duplicate execution when a reply exceeds the connection deadline.
+- Keep initialized rooms polling while another room initializes. Retry partial backlog
+  failures with bounded backoff; require durable acknowledgement before advancing.
+- Cancel and await initialization when a discovered room disappears or the adapter
+  disconnects. Reclaim completed tasks and preserve exact ownership on room re-entry.
+
+### Tests
+
+- Add real-Hermes startup, partial-retry, cross-room progress, disconnect, discovery
+  removal, task cleanup and in-flight acknowledgement regressions to CI.
+
 ## [0.1.10] - 2026-09-15
 
 ### Fixed

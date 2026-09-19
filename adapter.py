@@ -1578,6 +1578,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         self._client: Optional[NextcloudTalkClient] = None
         self._poll_task: Optional[asyncio.Task] = None
+        self._initialization_tasks: Dict[str, asyncio.Task] = {}
         # Durable successful-message ledger plus process-local dispatch guards.
         self._last_message_ids: Dict[str, int] = {}
         self._ack_rooms: Dict[str, Dict[str, Any]] = {}
@@ -1841,10 +1842,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._load_cursors()
             # Room metadata is useful even when DM auto-discovery is disabled:
             # explicit type-1 rooms must still be classified as DMs.
-            await self._refresh_discovered_rooms(force=True)
-            for token in self.room_tokens:
-                if not self._is_room_initialized(token):
-                    await self._initialize_room(token)
+            await self._refresh_discovered_rooms(force=True, process_new_messages=False)
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_loop())
             rooms_safe = ", ".join(self._safe_room_token(t) for t in self.room_tokens)
@@ -1866,6 +1864,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        initialization_tasks = list(getattr(self, "_initialization_tasks", {}).values())
+        for task in initialization_tasks:
+            task.cancel()
+        if initialization_tasks:
+            await asyncio.gather(*initialization_tasks, return_exceptions=True)
+        self._initialization_tasks = {}
         self._ensure_ack_runtime()
         for key, event in list(self._inflight_generations.items()):
             if not self._generation_has_confirmed_success(event, key):
@@ -2456,9 +2460,41 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 return
             for message in messages:
                 await self._handle_talk_message(message, room_token, await_completion=True)
+                message_id = _strict_talk_message_id(message.get("id"))
+                if message_id is not None and not self._is_acknowledged(room_token, message_id):
+                    # A removed/re-added room may still own an accepted handler.
+                    # Deduplication alone is not proof that this backlog item finished.
+                    raise RuntimeError("backlog message is not acknowledged")
             self._mark_room_initialized(room_token)
         finally:
             self._initializing_rooms.discard(room_token)
+
+    def _schedule_room_initialization(self, room_token: str) -> None:
+        task = self._initialization_tasks.get(room_token)
+        if task is None or task.done():
+            task = asyncio.create_task(self._initialize_room_background(room_token))
+            self._initialization_tasks[room_token] = task
+            def completed(done: asyncio.Task) -> None:
+                if self._initialization_tasks.get(room_token) is done:
+                    self._initialization_tasks.pop(room_token, None)
+            task.add_done_callback(completed)
+
+    async def _initialize_room_background(self, room_token: str) -> None:
+        # Readiness precedes processing: startup may queue handlers until connect returns.
+        backoff = 1.0
+        while self._running and room_token in self.room_tokens:
+            try:
+                await self._initialize_room(room_token)
+                return
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[nextcloud_talk] Initialize room %s failed: %s",
+                    self._safe_room_token(room_token), _safe_outward_error_text(exc),
+                )
+                await asyncio.sleep(backoff)
+                backoff = min(backoff * 2, 60)
 
     async def _poll_loop(self) -> None:
         assert self._client is not None
@@ -2466,11 +2502,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         while self._running:
             try:
                 if self.auto_discover_rooms:
-                    await self._refresh_discovered_rooms()
+                    await self._refresh_discovered_rooms(process_new_messages=False)
                 # Poll all rooms concurrently
                 tasks = []
                 for token in self.room_tokens:
-                    tasks.append(self._poll_room(token))
+                    if not self._is_room_initialized(token):
+                        self._schedule_room_initialization(token)
+                    else:
+                        tasks.append(self._poll_room(token))
                 await asyncio.gather(*tasks)
                 backoff = 1.0
                 # While a room has unacknowledged work, _poll_room intentionally
@@ -2512,6 +2551,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         new_tokens = [token for token in discovered if token in discovered_set and token not in previous_discovered]
         removed_tokens = previous_discovered - discovered_set
 
+        # Stop intake for departed rooms before admitting replacements. Already
+        # accepted handlers retain their generation ownership until completion.
+        obsolete_tasks = []
+        for token in removed_tokens:
+            task = getattr(self, "_initialization_tasks", {}).get(token)
+            if task is not None:
+                task.cancel()
+                obsolete_tasks.append(task)
+        if obsolete_tasks:
+            await asyncio.gather(*obsolete_tasks, return_exceptions=True)
+
         self._discovered_room_tokens.difference_update(removed_tokens)
         self.room_tokens = configured + [
             token for token in discovered
@@ -2530,7 +2580,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 self._touch_ack_room(token, active=False)
                 ack_activity_changed = True
         for token in new_tokens:
-            if not self._is_room_initialized(token):
+            if process_new_messages and not self._is_room_initialized(token):
                 await self._initialize_room(token)
             self._discovered_room_tokens.add(token)
             if token not in self.room_tokens:

@@ -282,6 +282,20 @@ _UNAVAILABLE_FILE_REFETCH_DELAYS = (1.0, 2.0, 4.0)
 _UNAVAILABLE_FILE_REFETCH_TIMEOUT = 10.0
 _MIN_CONVERSATION_TYPE = 1
 _MAX_CONVERSATION_TYPE = 6
+# Exec-approval reactions (Matrix-style): choice word -> seeding emoji. The ♾ variants
+# with and without VS16 both map to "always", mirroring the Matrix adapter's table.
+_APPROVAL_REACTION_MAP: Dict[str, str] = {
+    "✅": "once", "🌀": "session", "♾️": "always", "♾": "always",
+    "\u267e\ufe0f": "always", "\u267e": "always", "❌": "deny", "❎": "deny",
+}
+_APPROVAL_EMOJI_BY_CHOICE: Dict[str, str] = {
+    "once": "✅", "session": "🌀", "always": "♾️", "deny": "❌",
+}
+# Talk marks reaction events as system messages of type "reaction"; the reacted-to
+# message id rides in the "parent" field (verified live on Talk 23.0.10 and against
+# spreed's Chat/Parser/ReactionParser.php + Model/Message.php).
+_APPROVAL_REACTION_SYSTEM_MESSAGES = frozenset({"reaction", "reaction_deleted", "reaction_revoked"})
+_DEFAULT_APPROVAL_TIMEOUT_SECONDS = 3600
 _ATTACHMENT_CACHE_MANIFEST_VERSION = 1
 _MAX_ATTACHMENT_CACHE_MANIFEST_BYTES = 1024
 _PERMANENT_ATTACHMENT_HTTP_STATUSES = {400, 404, 410, 413, 414, 415, 416, 422}
@@ -503,6 +517,29 @@ def _truthy(value: Any, default: bool = False) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
 
 
+def _resolve_approval_timeout_seconds(extra: Optional[dict]) -> float:
+    """Approval prompt lifetime: NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS (or YAML
+    ``approval_timeout_seconds``) overrides the gateway's approvals.timeout, which
+    itself defaults to 300s. A hard floor keeps a misconfigured 0/negative from
+    producing prompts that expire before the seed reactions land."""
+    raw = _cfg(extra, "NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS", "approval_timeout_seconds", None)
+    if raw is not None:
+        try:
+            value = float(str(raw).strip())
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > 0:
+            return max(1.0, value)
+    try:
+        from gateway.platforms.base_exec_approval import approval_timeout_seconds
+        configured = float(approval_timeout_seconds())
+    except Exception:
+        configured = 0.0
+    if configured > 0:
+        return max(1.0, configured)
+    return float(_DEFAULT_APPROVAL_TIMEOUT_SECONDS)
+
+
 def _csv_set(value: str) -> set[str]:
     return {part.strip() for part in (value or "").split(",") if part.strip()}
 
@@ -619,6 +656,29 @@ def _log_cursor_cache_warning(operation: str, exc: BaseException) -> None:
 
 class AttachmentDownloadError(NextcloudTalkAPIError):
     """Inbound attachment failure that must block cursor commit."""
+
+
+class _ApprovalReactionPrompt:
+    """One pending reaction-driven exec-approval prompt (Matrix-parity shape)."""
+
+    __slots__ = (
+        "session_key", "chat_id", "message_id", "resolved", "requester_user_id",
+        "expires_at", "choices", "seeded_emojis",
+    )
+
+    def __init__(
+        self, *, session_key: str, chat_id: str, message_id: str,
+        requester_user_id: Optional[str], expires_at: float, choices: tuple,
+        seeded_emojis: tuple = (),
+    ) -> None:
+        self.session_key = session_key
+        self.chat_id = chat_id
+        self.message_id = message_id
+        self.resolved = False
+        self.requester_user_id = requester_user_id
+        self.expires_at = expires_at
+        self.choices = choices
+        self.seeded_emojis = tuple(seeded_emojis)
 
 
 class _AttachmentCacheLease:
@@ -2124,6 +2184,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._running = False
         self._cursor_lock = threading.RLock()
 
+        # Native reaction approvals (Matrix-parity): pending prompts keyed by the
+        # Talk message id that carries them, plus one prompt per session (a newer
+        # prompt replaces the older one — see _register_approval_prompt).
+        self._approval_timeout_seconds = _resolve_approval_timeout_seconds(extra)
+        self._approval_require_sender = _truthy(
+            _cfg(extra, "NEXTCLOUD_APPROVAL_REQUIRE_SENDER", "approval_require_sender", None),
+            True,
+        )
+        self._approval_prompts_by_event: Dict[str, _ApprovalReactionPrompt] = {}
+        self._approval_prompt_by_session: Dict[str, str] = {}
+
     @property
     def name(self) -> str:
         return "Nextcloud Talk"
@@ -2585,6 +2656,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._inflight_message_ids.clear()
         self._initializing_rooms.clear()
         self._release_cursor_writer()
+        # Pending reaction prompts are process-local; drop them on disconnect so a
+        # stale prompt cannot resolve a future session's approval.
+        self._approval_prompts_by_event.clear()
+        self._approval_prompt_by_session.clear()
         self._mark_disconnected()
         logger.info("[nextcloud_talk] Disconnected")
 
@@ -3927,6 +4002,265 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 pass
         return False
 
+    def _room_has_pending_approval_prompt(self, room_token: str) -> bool:
+        """Whether any pending exec-approval prompt lives in this room (keeps polling
+        alive while an agent turn is blocked waiting on the reaction tap)."""
+        # Defensive: instances that never run the approval init path (test
+        # adapters built via __new__, older bundle versions) lack the registry
+        # — that simply means no pending prompts.
+        registry = getattr(self, "_approval_prompts_by_event", None)
+        if not registry:
+            return False
+        return any(
+            prompt.chat_id == room_token
+            for prompt in registry.values()
+        )
+
+    # ── Native reaction approvals (Matrix-style) ────────────────────────────
+    # Design: inbound resolution rides the existing long-poll. Talk emits every
+    # reaction as its own chat message (messageType "system", systemMessage
+    # "reaction", message = the emoji, actorId = the reacting user, parent = the
+    # reacted-to message id — verified live on Talk 23.0.10 and against spreed's
+    # ReactionParser). That stream already reaches _poll_room with zero extra
+    # requests and carries the actor inline, so unlike an active get_reactions
+    # delta-poller it needs no per-prompt API traffic, no per-prompt state about
+    # which actors were already seen, and no races between poll cycles. The
+    # reactions GET route remains available on the client for ad-hoc inspection
+    # only. Bot-seeded reactions are never treated as answers (requirement 3):
+    # self rows are skipped by username comparison before any prompt lookup.
+
+    async def send_exec_approval(
+        self, chat_id: str, command: str, session_key: str, description: str = "dangerous command",
+        metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
+        smart_denied: bool = False,
+    ) -> SendResult:
+        """Native reaction approvals; inherited core code builds the shared text
+        and the choice set, then _send_exec_approval_prompt renders them as seeded
+        Talk reactions. Fail-closed: a SendResult(success=False) makes the gateway
+        fall back to its plain-text /approve prompt."""
+        return await super().send_exec_approval(
+            chat_id=chat_id, command=command, session_key=session_key,
+            description=description, metadata=metadata, allow_permanent=allow_permanent,
+            allow_session=allow_session, smart_denied=smart_denied,
+        )
+
+    async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
+        """Send the approval text, register the prompt under the returned message
+        id, then seed one reaction per offered choice (bot-only). Any failure to
+        seed degrades to the gateway's text fallback — never to a silently dead
+        prompt with fewer buttons than choices."""
+        if not self._client:
+            return SendResult(success=False, error="Not connected")
+        session_key = str(prompt.session_key or "")
+        chat_id = str(prompt.chat_id or "")
+        if not session_key or not chat_id:
+            return SendResult(success=False, error="Approval prompt missing session or room")
+        result = await self.send(chat_id, prompt.text, metadata=prompt.metadata)
+        if not result.success or not result.message_id:
+            return result
+        message_id = result.message_id
+        requester = str((prompt.metadata or {}).get("requester_user_id") or "").strip() or None
+        reactions: List[str] = []
+        for _label, choice, _style in prompt.actions:
+            emoji = _APPROVAL_EMOJI_BY_CHOICE.get(choice)
+            if emoji and emoji not in reactions:
+                reactions.append(emoji)
+        if not reactions:
+            # Unknown choice vocabulary: do not seed a misleading button set.
+            return SendResult(success=False, error="Approval prompt has no mappable choices")
+        reaction_prompt = self._register_approval_prompt(
+            session_key=session_key, chat_id=chat_id, message_id=message_id,
+            requester_user_id=requester, choices=tuple(
+                choice for _label, choice, _style in prompt.actions
+            ), seeded_emojis=tuple(reactions),
+        )
+        # Serialize the seed reactions: Talk rate-limits bursts of reaction POSTs
+        # (observed 429 + Retry-After), and a dropped seed is a dead button.
+        seeded: List[str] = []
+        try:
+            for emoji in reactions:
+                # Record BEFORE the await: a failed POST may still have landed
+                # server-side (429 after commit), so the conservative cleanup
+                # retracts the emoji even when the call raised.
+                seeded.append(emoji)
+                await self._client.react_to_message(
+                    chat_id, int(message_id), emoji
+                )
+                await asyncio.sleep(0.25)
+        except Exception as exc:
+            logger.warning(
+                "[nextcloud_talk] Approval reactions %s could not be seeded (%s); "
+                "falling back to the text prompt",
+                self._safe_room_token(chat_id), _safe_outward_error_text(exc),
+            )
+            self._discard_approval_prompt(reaction_prompt)
+            cleanup = [
+                seed for seed in seeded
+            ]
+            for seed in cleanup:
+                try:
+                    await self._client.remove_reaction(chat_id, int(message_id), seed)
+                except Exception:
+                    pass
+            return SendResult(
+                success=False, error=_safe_outward_error_text(exc),
+                message_id=message_id,
+            )
+        return result
+
+    def _register_approval_prompt(
+        self, *, session_key: str, chat_id: str, message_id: str,
+        requester_user_id: Optional[str], choices: tuple, seeded_emojis: tuple,
+    ) -> _ApprovalReactionPrompt:
+        """Race safety: at most one prompt per session; a new prompt retires the
+        previous registration for that session (its leftover reactions are cleaned
+        up best-effort in the background)."""
+        old_message_id = self._approval_prompt_by_session.pop(session_key, None)
+        if old_message_id and old_message_id != message_id:
+            old_prompt = self._approval_prompts_by_event.pop(old_message_id, None)
+            if old_prompt is not None:
+                old_prompt.resolved = True
+                asyncio.ensure_future(self._remove_seed_reactions(chat_id, old_message_id, old_prompt))
+        prompt = _ApprovalReactionPrompt(
+            session_key=session_key, chat_id=chat_id, message_id=message_id,
+            requester_user_id=requester_user_id,
+            expires_at=time.monotonic() + max(self._approval_timeout_seconds, 1.0),
+            choices=choices, seeded_emojis=seeded_emojis,
+        )
+        self._approval_prompts_by_event[message_id] = prompt
+        self._approval_prompt_by_session[session_key] = message_id
+        return prompt
+
+    def _discard_approval_prompt(self, prompt: _ApprovalReactionPrompt) -> None:
+        prompt.resolved = True
+        self._approval_prompts_by_event.pop(prompt.message_id, None)
+        if self._approval_prompt_by_session.get(prompt.session_key) == prompt.message_id:
+            self._approval_prompt_by_session.pop(prompt.session_key, None)
+
+    async def _remove_seed_reactions(self, room_token: str, message_id: str,
+                                     prompt: _ApprovalReactionPrompt) -> None:
+        """Retract the bot's own choice reactions (post-resolve cleanup)."""
+        client = self._client
+        if client is None:
+            return
+        for emoji in prompt.seeded_emojis:
+            try:
+                await client.remove_reaction(room_token, int(message_id), emoji)
+            except Exception:
+                pass
+
+    async def _handle_approval_system_message(self, msg: Dict[str, Any], room_token: str) -> bool:
+        """Consume one poll row when it is a reaction on a pending approval prompt.
+
+        Returns True when the row was handled (or deliberately discarded) as an
+        approval event — the caller must then skip the regular turn path. Cursor
+        commitment is the caller's ACK runtime as usual: handled rows are ACKed
+        here so a restart does not replay them.
+        """
+        # Defensive: instances that never run the approval init path (test
+        # adapters built via __new__, older bundle versions) lack the registry.
+        if not getattr(self, "_approval_prompts_by_event", None):
+            return False
+        system_message = str(msg.get("systemMessage") or "")
+        if system_message not in _APPROVAL_REACTION_SYSTEM_MESSAGES:
+            return False
+        numeric_id = _strict_talk_message_id(msg.get("id"))
+        if numeric_id is None:
+            return False
+        target_id = msg.get("parent")
+        if isinstance(target_id, dict):
+            # Some server versions nest the parent object instead of the bare id.
+            target_id = target_id.get("id")
+        target_key = str(target_id) if _strict_talk_message_id(target_id) is not None else ""
+        prompt = self._approval_prompts_by_event.get(target_key)
+        if prompt is None or prompt.resolved:
+            # Not one of ours (or already settled): hand the row back to the
+            # regular poll flow, which skips system messages on its own.
+            return False
+        actor_id = str(msg.get("actorId") or "").strip()
+        actor_name = str(msg.get("actorDisplayName") or "").strip()
+        # Expired prompts retire on any reaction row — the emoji's author has no
+        # bearing on whether the controls are still live.
+        if self._approval_prompt_expired(prompt):
+            self._expire_approval_prompt(room_token, prompt)
+            self._commit_cursor(room_token, numeric_id)
+            return True
+        # The bot's own seeded reactions (and any other self-authored rows) are
+        # never answers, even though Talk delivers them through the same poll.
+        if actor_id and actor_id.lower() == self.username.lower():
+            self._commit_cursor(room_token, numeric_id)
+            return True
+        chat_type = "dm" if self._room_types.get(room_token) == 1 else "group"
+        choice = self._resolve_approval_choice(msg, room_token, prompt, actor_id, actor_name, chat_type)
+        if choice is None:
+            self._commit_cursor(room_token, numeric_id)
+            return True
+        resolved_count = 0
+        try:
+            from tools.approval import resolve_gateway_approval
+            resolved_count = int(resolve_gateway_approval(prompt.session_key, choice) or 0)
+        except Exception as exc:
+            logger.error(
+                "[nextcloud_talk] Failed to resolve gateway approval from reaction: %s",
+                _safe_outward_error_text(exc),
+            )
+        if resolved_count:
+            prompt.resolved = True
+            self._discard_approval_prompt(prompt)
+            logger.info(
+                "[nextcloud_talk] Reaction approval resolved %d pending request(s) for "
+                "session %s (choice=%s, user=%s)",
+                resolved_count, self._safe_room_token(prompt.session_key), choice,
+                _safe_log_text(actor_id or actor_name, 256),
+            )
+            cleanup_prompt = prompt
+            async def _cleanup_after_resolve() -> None:
+                client = self._client
+                if client is None:
+                    return
+                await self._remove_seed_reactions(room_token, cleanup_prompt.message_id, cleanup_prompt)
+            asyncio.ensure_future(_cleanup_after_resolve())
+        self._commit_cursor(room_token, numeric_id)
+        return True
+
+    def _approval_prompt_expired(self, prompt: _ApprovalReactionPrompt) -> bool:
+        return time.monotonic() > float(prompt.expires_at)
+
+    def _resolve_approval_choice(
+        self, msg: Dict[str, Any], room_token: str, prompt: _ApprovalReactionPrompt,
+        actor_id: str, actor_name: str, chat_type: str,
+    ) -> Optional[str]:
+        """Gate chain: allowed sender -> (optionally) the prompt's requester ->
+        known emoji -> choice word. None means consumed-and-ignored."""
+        emoji = str(msg.get("message") or "").strip()
+        if not self._is_allowed(actor_id, actor_name, chat_type=chat_type):
+            logger.debug(
+                "[nextcloud_talk] Ignoring approval reaction from unauthorized user %s",
+                _safe_log_text(actor_id or actor_name, 256),
+            )
+            return None
+        if self._approval_require_sender and prompt.requester_user_id:
+            requester = prompt.requester_user_id.strip().lower()
+            if requester and actor_id.strip().lower() != requester:
+                logger.info(
+                    "[nextcloud_talk] Ignoring approval reaction from %s; requester is %s",
+                    _safe_log_text(actor_id, 256), _safe_log_text(prompt.requester_user_id, 256),
+                )
+                return None
+        return _APPROVAL_REACTION_MAP.get(emoji)
+
+    def _expire_approval_prompt(self, room_token: Optional[str], prompt: _ApprovalReactionPrompt) -> None:
+        """Retire an expired prompt and retract the bot's seed reactions."""
+        self._discard_approval_prompt(prompt)
+        target_room = room_token or prompt.chat_id
+        if self._client is not None:
+            asyncio.ensure_future(self._remove_seed_reactions(target_room, prompt.message_id, prompt))
+
+    def _prune_expired_approval_prompts(self) -> None:
+        for prompt in list(self._approval_prompts_by_event.values()):
+            if self._approval_prompt_expired(prompt):
+                self._expire_approval_prompt(prompt.chat_id, prompt)
+
     def _room_has_pending_clarify(self, room_token: str) -> bool:
         """Return whether an in-flight turn is blocked on a clarify response."""
         return any(
@@ -4642,6 +4976,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             # Direct calls share the poller's deterministic skip contract.
             return
         if (not text and not file_refs) or system_message:
+            # Second-chance approval intake: reaction rows normally never reach the
+            # turn path (the _poll_room intake consumes them first), but a row that
+            # slips through — e.g. delivered while the prompt was still being
+            # registered — must still resolve instead of being silently dropped.
+            if await self._handle_approval_system_message(msg, room_token):
+                return
             self._commit_cursor(room_token, numeric_id)
             return
         if actor_id and actor_id.lower() == self.username.lower():
@@ -5551,6 +5891,22 @@ def validate_config(config) -> bool:
 
 
 def is_connected(config) -> bool:
+    # Env-gestützte Prüfung — scope-aware (get_scoped_secret, wie die Core-Plattformen):
+    # die Cron-Preflight-Checks und Statusanzeigen rufen dies mit einer rohen
+    # PlatformConfig (extra={}) — validate_config allein liest nur YAML-extra und
+    # meldet fälschlich "nicht verbunden". Unter Multiplex borriert der scoped
+    # Read NIE den Launcher (sekundäres Profil ohne eigene Creds bleibt disconnected).
+    try:
+        from gateway.platforms._shared import get_scoped_secret
+        # external_fallback: startup gates run before any scope exists — the
+        # profile's OWN .env is consulted (never another profile's values).
+        url = str(get_scoped_secret("NEXTCLOUD_TALK_URL", external_fallback=True) or "").strip()
+        user = str(get_scoped_secret("NEXTCLOUD_TALK_USERNAME", external_fallback=True) or "").strip()
+        pw = str(get_scoped_secret("NEXTCLOUD_TALK_PASSWORD", external_fallback=True) or "").strip()
+        if url and user and pw:
+            return True
+    except Exception:
+        pass
     return validate_config(config)
 
 
@@ -5641,6 +5997,7 @@ def register(ctx) -> None:
         max_message_length=_DEFAULT_MAX_MESSAGE_LENGTH,
         emoji="☁️",
         allow_update_command=True,
+        cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
         platform_hint=(
             "You are chatting via Nextcloud Talk (multi-room). Talk renders Markdown: bold, lists, "
             "code blocks, links and simple tables work; images are shown as link previews. "

@@ -102,9 +102,9 @@ class ApprovalReactionTestBase(unittest.IsolatedAsyncioTestCase):
             "parent": target if parent is None else parent,
         }
 
-    async def seed_prompt(self, instance, **kwargs):
+    async def seed_prompt(self, instance, prompt=None, **kwargs):
         with patch.object(adapter.asyncio, "sleep", new=lambda *_a, **_k: _noop()):
-            return await instance._send_exec_approval_prompt(_approval_prompt(**kwargs))
+            return await instance._send_exec_approval_prompt(prompt or _approval_prompt(**kwargs))
 
 
 class SendExecApprovalSeedsReactionsTests(ApprovalReactionTestBase):
@@ -197,7 +197,7 @@ class InboundReactionResolutionTests(ApprovalReactionTestBase):
         await self.seed_prompt(instance)
         resolved = []
 
-        def fake_resolve(session_key, choice):
+        def fake_resolve(session_key, choice, request_id=None):
             resolved.append((session_key, choice))
             return 1
 
@@ -264,7 +264,7 @@ class InboundReactionResolutionTests(ApprovalReactionTestBase):
             await instance._handle_approval_system_message(
                 self.reaction_row("✅", actor_id="alice"), "dm-room"
             )
-        resolve.assert_called_once_with("sess-1", "once")
+        resolve.assert_called_once_with("sess-1", "once", request_id=None)
 
     async def test_wrong_emoji_is_ignored(self):
         instance = self.make_adapter(allowed={"steffen.schoft"})
@@ -287,7 +287,7 @@ class InboundReactionResolutionTests(ApprovalReactionTestBase):
                     await instance._handle_approval_system_message(
                         self.reaction_row(emoji, numeric_id=9100 + len(choice)), "dm-room"
                     )
-                resolve.assert_called_once_with("sess-1", choice)
+                resolve.assert_called_once_with("sess-1", choice, request_id=None)
 
     async def test_bot_own_reactions_are_never_answers(self):
         instance = self.make_adapter(username="naya.bot", allowed={"naya.bot"})
@@ -402,6 +402,76 @@ class PollPathIntakeTests(ApprovalReactionTestBase):
             await instance._handle_talk_message(self.reaction_row("✅"), "dm-room")
         self.assertEqual(instance._approval_prompts_by_event, {})
 
+    async def test_prune_without_registry_does_not_abort_the_poll(self):
+        """An adapter with no approval registry must still poll.
+
+        _prune_expired_approval_prompts runs inside _poll_room's try block, so touching
+        the registry unguarded raised AttributeError there and the generic handler
+        swallowed it — every message in the batch was dropped without a trace.
+        """
+        instance = self.make_adapter(allowed={"steffen.schoft"})
+        self.make_poll_adapter(instance)
+        instance._config = types.SimpleNamespace(extra={})
+        instance._inflight_generations = {}
+        instance._inflight_message_ids = {}
+        instance._ack_rooms = {"dm-room": {"floor": 0, "successful": set(), "initialized": True}}
+        # Exactly the shape of an instance that never ran the approval init path.
+        del instance._approval_prompts_by_event
+        del instance._approval_prompt_by_session
+        handled = []
+
+        async def handle_talk_message(msg, room, **_kwargs):
+            handled.append((msg["id"], room))
+
+        async def get_messages(*_args, **_kwargs):
+            return [{"id": 77, "actorType": "users", "actorId": "alice", "message": "hi"}]
+
+        instance._handle_talk_message = handle_talk_message
+        instance._client.get_messages = get_messages
+        instance._prune_expired_approval_prompts()  # must not raise on its own
+        await instance._poll_room("dm-room")
+        self.assertEqual(handled, [(77, "dm-room")])
+
+    async def test_core_pending_approval_keeps_polling_without_a_card(self):
+        """Keepalive must not depend on a successfully seeded reaction card.
+
+        Covers the plain-text /approve fallback (seeding failed) and a card that expired
+        while core still holds the request: in both the registry is empty, and the room
+        gate would otherwise freeze the only consumer able to deliver the answer.
+        """
+        instance = self.make_adapter()
+        self.make_poll_adapter(instance)
+        instance._inflight_message_ids = {"dm-room": {1}}
+        instance._inflight_generations = {
+            ("dm-room", 1): types.SimpleNamespace(source=object()),
+        }
+        # No card registered anywhere.
+        instance._approval_prompts_by_event = {}
+        instance._approval_prompt_by_session = {}
+        self.assertFalse(instance._room_has_pending_approval_prompt("dm-room"))
+        instance._source_session_key = lambda _source: "sess-1"
+
+        with patch("tools.approval.has_blocking_approval", return_value=True):
+            self.assertTrue(instance._room_has_pending_exec_approval("dm-room"))
+        with patch("tools.approval.has_blocking_approval", return_value=False):
+            self.assertFalse(instance._room_has_pending_exec_approval("dm-room"))
+        # A room with no in-flight turn never consults core.
+        self.assertFalse(instance._room_has_pending_exec_approval("group-room"))
+
+    async def test_reaction_that_resolves_nothing_is_logged_at_warning(self):
+        """A tap resolving 0 requests must leave a trace: silence made a dead button
+        indistinguishable from 'the user never reacted'."""
+        instance = self.make_adapter(allowed={"steffen.schoft"})
+        await self.seed_prompt(instance)
+        with patch("tools.approval.resolve_gateway_approval", return_value=0), \
+                patch("tools.approval.has_blocking_approval", return_value=True), \
+                self.assertLogs(adapter.logger, level="WARNING") as logs:
+            await instance._handle_approval_system_message(self.reaction_row("✅"), "dm-room")
+        rendered = "\n".join(logs.output)
+        self.assertIn("resolved NOTHING", rendered)
+        # The prompt stays live: core still has something to answer.
+        self.assertIn("4242", instance._approval_prompts_by_event)
+
 
 class ApprovalTimeoutTests(ApprovalReactionTestBase):
     def test_timeout_prefers_env_override(self):
@@ -492,3 +562,101 @@ class SupportsExecApprovalButtonsTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+class RequestIdBindingTests(ApprovalReactionTestBase):
+    """Elara-Review fixes: request_id binding, room gate, choice whitelist, prune."""
+
+    def make_allowed_adapter(self, **kwargs):
+        kwargs.setdefault("allowed", ("steffen.schoft",))
+        return self.make_adapter(**kwargs)
+
+    def _prompt_with_request_id(self, request_id, **kwargs):
+        prompt = _approval_prompt(**kwargs)
+        prompt.metadata = {"requester_user_id": "steffen.schoft", "approval_request_id": request_id}
+        return prompt
+
+    async def test_seed_records_request_id_from_metadata(self):
+        instance = self.make_adapter()
+        await self.seed_prompt(instance, prompt=self._prompt_with_request_id("req-abc"))
+        prompt = instance._approval_prompts_by_event["4242"]
+        self.assertEqual(prompt.request_id, "req-abc")
+
+    async def test_seed_without_request_id_stays_empty(self):
+        instance = self.make_adapter()
+        await self.seed_prompt(instance)  # default metadata has no approval_request_id
+        prompt = self._approval_prompt_get(instance)
+        self.assertEqual(prompt.request_id, "")
+
+    def _approval_prompt_get(self, instance):
+        return instance._approval_prompts_by_event["4242"]
+
+    async def test_resolve_uses_request_id(self):
+        instance = self.make_allowed_adapter()
+        instance._room_types = {"dm-room": 1}
+        await self.seed_prompt(instance, prompt=self._prompt_with_request_id("req-xyz"))
+        prompt = self._approval_prompt_get(instance)
+        captured = {}
+
+        def fake_resolve(session_key, choice, request_id=None):
+            captured.update(session_key=session_key, choice=choice, request_id=request_id)
+            return 1
+
+        with patch.object(adapter, "_APPROVAL_REACTION_SYSTEM_MESSAGES", ("reaction",)), \
+             patch("tools.approval.resolve_gateway_approval", new=fake_resolve):
+            handled = await instance._handle_approval_system_message(
+                self.reaction_row("✅", target=4242), "dm-room")
+        self.assertTrue(handled)
+        self.assertEqual(captured["request_id"], "req-xyz")
+
+    async def test_unoffered_choice_cannot_resolve(self):
+        instance = self.make_allowed_adapter()
+        instance._room_types = {"dm-room": 1}
+        # Smart-deny card: only once + deny offered — ♾️ (always) was NOT offered.
+        await self.seed_prompt(instance, choices=("once", "deny"))
+        prompt = self._approval_prompt_get(instance)
+        resolved = []
+
+        def fake_resolve(session_key, choice, request_id=None):
+            resolved.append(choice)
+            return 1
+
+        with patch.object(adapter, "_APPROVAL_REACTION_SYSTEM_MESSAGES", ("reaction",)), \
+             patch("tools.approval.resolve_gateway_approval", new=fake_resolve):
+            handled = await instance._handle_approval_system_message(
+                self.reaction_row("♾️", target=4242), "dm-room")
+        self.assertTrue(handled)
+        self.assertEqual(resolved, [])  # not offered → consumed-and-ignored
+
+    async def test_reaction_from_other_room_does_not_resolve(self):
+        instance = self.make_adapter()
+        await self.seed_prompt(instance)  # prompt.chat_id = "dm-room"
+        prompt = self._approval_prompt_get(instance)
+        resolved = []
+
+        def fake_resolve(session_key, choice, request_id=None):
+            resolved.append(choice)
+            return 1
+
+        with patch.object(adapter, "_APPROVAL_REACTION_SYSTEM_MESSAGES", ("reaction",)), \
+             patch("tools.approval.resolve_gateway_approval", new=fake_resolve):
+            handled = await instance._handle_approval_system_message(
+                self.reaction_row("✅", target=4242), "group-room")
+        self.assertTrue(handled)
+        self.assertEqual(resolved, [])
+
+    async def test_poll_room_invokes_prune(self):
+        instance = self.make_adapter()
+        instance.max_poll_batch = 20
+        instance.poll_timeout = 1
+        instance._prune_expired_approval_prompts = lambda: setattr(self, "pruned", True)
+        self.pruned = False
+
+        async def fail_get_messages(*_a, **_k):
+            raise AssertionError("poll should have returned before fetching")
+
+        instance._client.get_messages = fail_get_messages
+        instance._inflight_message_ids = {"dm-room": 55}
+        instance._room_has_pending_clarify = lambda token: False
+        instance._room_has_pending_approval_prompt = lambda token: False
+        await instance._poll_room("dm-room")
+        self.assertTrue(self.pruned)

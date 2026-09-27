@@ -663,13 +663,13 @@ class _ApprovalReactionPrompt:
 
     __slots__ = (
         "session_key", "chat_id", "message_id", "resolved", "requester_user_id",
-        "expires_at", "choices", "seeded_emojis",
+        "expires_at", "choices", "seeded_emojis", "request_id",
     )
 
     def __init__(
         self, *, session_key: str, chat_id: str, message_id: str,
         requester_user_id: Optional[str], expires_at: float, choices: tuple,
-        seeded_emojis: tuple = (),
+        seeded_emojis: tuple = (), request_id: str = "",
     ) -> None:
         self.session_key = session_key
         self.chat_id = chat_id
@@ -679,6 +679,7 @@ class _ApprovalReactionPrompt:
         self.expires_at = expires_at
         self.choices = choices
         self.seeded_emojis = tuple(seeded_emojis)
+        self.request_id = request_id
 
 
 class _AttachmentCacheLease:
@@ -1164,6 +1165,23 @@ class NextcloudTalkClient:
                 seen.add(token)
                 result.append({"token": token, "type": conversation_type})
         return result
+
+    async def list_channels(self) -> List[dict]:
+        """Directory hook: DMs und Gruppenraeume fuer send-Ziel-Aufloesung (LOR-061)."""
+        raw = await asyncio.to_thread(
+            self._ocs_get, "/ocs/v2.php/apps/spreed/api/v4/room", expected_types=(list,)
+        )
+        channels: List[dict] = []
+        for conversation in raw if isinstance(raw, list) else []:
+            if not isinstance(conversation, dict):
+                continue
+            token = conversation.get("token")
+            name = conversation.get("displayName") or conversation.get("name") or ""
+            ctype = conversation.get("type")
+            if not token or not name:
+                continue
+            channels.append({"id": str(token), "name": str(name), "type": "group" if ctype != 1 else "dm"})
+        return channels
 
     async def list_conversation_tokens(self) -> List[str]:
         return [room["token"] for room in await self.list_conversations() if room["type"] == 1]
@@ -4016,6 +4034,25 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             for prompt in registry.values()
         )
 
+    def _room_has_pending_exec_approval(self, room_token: str) -> bool:
+        """Whether an in-flight turn in this room is blocked on a core exec approval.
+
+        Asks Hermes core directly instead of trusting the local card registry, so the poll
+        keepalive also covers a failed reaction seeding (plain-text /approve fallback) and a
+        card that already expired while the request itself is still pending. Mirrors the
+        shape of :meth:`_room_has_pending_clarify`.
+        """
+        inflight = getattr(self, "_inflight_generations", None)
+        if not inflight:
+            return False
+        for key, event in list(inflight.items()):
+            if not key or key[0] != room_token:
+                continue
+            session_key = self._source_session_key(getattr(event, "source", None))
+            if session_key and self._session_has_blocking_approval(session_key):
+                return True
+        return False
+
     # ── Native reaction approvals (Matrix-style) ────────────────────────────
     # Design: inbound resolution rides the existing long-poll. Talk emits every
     # reaction as its own chat message (messageType "system", systemMessage
@@ -4060,6 +4097,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return result
         message_id = result.message_id
         requester = str((prompt.metadata or {}).get("requester_user_id") or "").strip() or None
+        # Hermes-core approval request_id (set by run_turn_runner when available): binds this
+        # Talk card to EXACTLY one queued approval so a reaction resolves the right request
+        # even when the same session has several pending exec approvals.
+        request_id = str((prompt.metadata or {}).get("approval_request_id") or "").strip()
         reactions: List[str] = []
         for _label, choice, _style in prompt.actions:
             emoji = _APPROVAL_EMOJI_BY_CHOICE.get(choice)
@@ -4072,7 +4113,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             session_key=session_key, chat_id=chat_id, message_id=message_id,
             requester_user_id=requester, choices=tuple(
                 choice for _label, choice, _style in prompt.actions
-            ), seeded_emojis=tuple(reactions),
+            ), seeded_emojis=tuple(reactions), request_id=request_id,
         )
         # Serialize the seed reactions: Talk rate-limits bursts of reaction POSTs
         # (observed 429 + Retry-After), and a dropped seed is a dead button.
@@ -4111,6 +4152,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     def _register_approval_prompt(
         self, *, session_key: str, chat_id: str, message_id: str,
         requester_user_id: Optional[str], choices: tuple, seeded_emojis: tuple,
+        request_id: str = "",
     ) -> _ApprovalReactionPrompt:
         """Race safety: at most one prompt per session; a new prompt retires the
         previous registration for that session (its leftover reactions are cleaned
@@ -4125,7 +4167,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             session_key=session_key, chat_id=chat_id, message_id=message_id,
             requester_user_id=requester_user_id,
             expires_at=time.monotonic() + max(self._approval_timeout_seconds, 1.0),
-            choices=choices, seeded_emojis=seeded_emojis,
+            choices=choices, seeded_emojis=seeded_emojis, request_id=request_id,
         )
         self._approval_prompts_by_event[message_id] = prompt
         self._approval_prompt_by_session[session_key] = message_id
@@ -4191,6 +4233,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._commit_cursor(room_token, numeric_id)
             return True
         chat_type = "dm" if self._room_types.get(room_token) == 1 else "group"
+        # Room-binding gate: a reaction row from a DIFFERENT room never resolves a prompt.
+        if prompt.chat_id != room_token:
+            logger.info(
+                "[nextcloud_talk] Ignoring approval reaction in room %s; prompt lives in %s",
+                self._safe_room_token(room_token), self._safe_room_token(prompt.chat_id),
+            )
+            self._commit_cursor(room_token, numeric_id)
+            return True
         choice = self._resolve_approval_choice(msg, room_token, prompt, actor_id, actor_name, chat_type)
         if choice is None:
             self._commit_cursor(room_token, numeric_id)
@@ -4198,7 +4248,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         resolved_count = 0
         try:
             from tools.approval import resolve_gateway_approval
-            resolved_count = int(resolve_gateway_approval(prompt.session_key, choice) or 0)
+            # Resolve by the bound request_id when core provided one — a session with several
+            # pending approvals must never resolve the FIFO-oldest from a newest-card tap.
+            resolved_count = int(resolve_gateway_approval(
+                prompt.session_key, choice, request_id=prompt.request_id or None,
+            ) or 0)
         except Exception as exc:
             logger.error(
                 "[nextcloud_talk] Failed to resolve gateway approval from reaction: %s",
@@ -4220,8 +4274,44 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     return
                 await self._remove_seed_reactions(room_token, cleanup_prompt.message_id, cleanup_prompt)
             asyncio.ensure_future(_cleanup_after_resolve())
+        else:
+            # A tap that resolves NOTHING used to be silent: resolve_gateway_approval returns 0
+            # for an empty queue and the success log sat behind `if resolved_count`. That made a
+            # dead button indistinguishable from "the user never reacted" — on 2026-09-26 it cost
+            # five one-hour blocks before anyone could tell which of the two was happening.
+            # Never downgrade this to debug.
+            still_pending = self._session_has_blocking_approval(prompt.session_key)
+            logger.warning(
+                "[nextcloud_talk] Approval reaction '%s' (choice=%s) from %s resolved NOTHING for "
+                "session %s (request_id=%s); core queue still has a pending request: %s",
+                _safe_log_text(str(msg.get("message") or ""), 32), choice,
+                _safe_log_text(actor_id or actor_name, 256),
+                self._safe_room_token(prompt.session_key),
+                _safe_log_text(prompt.request_id or "<none>", 64), still_pending,
+            )
+            # Deliberately NOT retired here, even when nothing is pending: the request may have
+            # just been settled through another surface (TUI /approve, dashboard, second client),
+            # and retiring a card the user still needs is worse than leaving a stale-looking one.
+            # Expiry is the only thing that retires a prompt — see the expiry branch above and
+            # test_denials_when_gateway_has_nothing_pending_retire_expired_prompt_only.
         self._commit_cursor(room_token, numeric_id)
         return True
+
+    def _session_has_blocking_approval(self, session_key: str) -> bool:
+        """Whether Hermes core still holds an unresolved exec approval for *session_key*.
+        Import is local and failure-tolerant: older cores lack the helper, and a missing
+        introspection hook must never break the reaction path itself."""
+        if not session_key:
+            return False
+        try:
+            from tools.approval import has_blocking_approval
+        except Exception:
+            return False
+        try:
+            return bool(has_blocking_approval(session_key))
+        except Exception:
+            logger.debug("[nextcloud_talk] has_blocking_approval probe failed", exc_info=True)
+            return False
 
     def _approval_prompt_expired(self, prompt: _ApprovalReactionPrompt) -> bool:
         return time.monotonic() > float(prompt.expires_at)
@@ -4231,7 +4321,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         actor_id: str, actor_name: str, chat_type: str,
     ) -> Optional[str]:
         """Gate chain: allowed sender -> (optionally) the prompt's requester ->
-        known emoji -> choice word. None means consumed-and-ignored."""
+        known emoji -> offered choice. None means consumed-and-ignored."""
         emoji = str(msg.get("message") or "").strip()
         if not self._is_allowed(actor_id, actor_name, chat_type=chat_type):
             logger.debug(
@@ -4247,7 +4337,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     _safe_log_text(actor_id, 256), _safe_log_text(prompt.requester_user_id, 256),
                 )
                 return None
-        return _APPROVAL_REACTION_MAP.get(emoji)
+        choice = _APPROVAL_REACTION_MAP.get(emoji)
+        if choice is None:
+            return None
+        # Only choices THIS prompt offered may resolve it: an unoffered emoji (e.g. ♾️ on a
+        # smart-deny card) must never resolve a tier the card did not show.
+        if choice not in prompt.choices:
+            logger.info(
+                "[nextcloud_talk] Ignoring approval reaction %s: choice %s not offered by prompt %s",
+                _safe_log_text(emoji, 32), choice, _safe_log_text(prompt.message_id, 64),
+            )
+            return None
+        return choice
 
     def _expire_approval_prompt(self, room_token: Optional[str], prompt: _ApprovalReactionPrompt) -> None:
         """Retire an expired prompt and retract the bot's seed reactions."""
@@ -4257,7 +4358,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             asyncio.ensure_future(self._remove_seed_reactions(target_room, prompt.message_id, prompt))
 
     def _prune_expired_approval_prompts(self) -> None:
-        for prompt in list(self._approval_prompts_by_event.values()):
+        # Same defensive read as _room_has_pending_approval_prompt and
+        # _handle_approval_system_message: instances that never ran the approval init path
+        # (test adapters built via __new__, older bundle versions) have no registry. This runs
+        # from inside _poll_room's try block, so an AttributeError here aborts the whole poll
+        # before a single message is handled — silently, because the generic handler swallows it.
+        registry = getattr(self, "_approval_prompts_by_event", None)
+        if not registry:
+            return
+        for prompt in list(registry.values()):
             if self._approval_prompt_expired(prompt):
                 self._expire_approval_prompt(prompt.chat_id, prompt)
 
@@ -5146,8 +5255,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 else:
                     text = text.replace("{" + key + "}", fname)
 
-        text = self._strip_bot_mention(text)
-        if self.require_mention and not text:
+        require_mention = self._requires_mention(chat_type)
+        text = self._strip_bot_mention(text, require_mention=require_mention)
+        if require_mention and not text:
+            logger.warning(
+                "[nextcloud_talk] Skipping message %s in room %s: mention required "
+                "but none found (chat_type=%s)",
+                _safe_log_text(msg_id, 64), self._safe_room_token(room_token), chat_type,
+            )
             self._commit_cursor(room_token, numeric_id)
             return
 
@@ -5341,10 +5456,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         allowed = self.group_allowed_users if chat_type in {"group", "forum", "channel"} else self.allowed_users
         return "*" in allowed or stable_id in allowed
 
-    def _strip_bot_mention(self, text: str) -> str:
+    def _requires_mention(self, chat_type: str) -> bool:
+        """Require an explicit bot mention in shared rooms, never in direct messages."""
+        return self.require_mention and chat_type != "dm"
+
+    def _strip_bot_mention(self, text: str, *, require_mention: Optional[bool] = None) -> str:
         raw = text.strip()
+        mention_required = self.require_mention if require_mention is None else require_mention
         if not self.bot_name:
-            return raw if not self.require_mention else ""
+            return raw if not mention_required else ""
         escaped = re.escape(self.bot_name.strip())
         patterns = [
             rf"^@?{escaped}[:,\s]+(.+)$",
@@ -5354,7 +5474,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             match = re.match(pattern, raw, flags=re.IGNORECASE | re.DOTALL)
             if match:
                 return match.group(1).strip()
-        return "" if self.require_mention else raw
+        return "" if mention_required else raw
 
     @staticmethod
     def _timestamp_from_message(msg: Dict[str, Any]) -> datetime:
@@ -5977,6 +6097,60 @@ def interactive_setup() -> None:
     print_info("Restart the gateway: hermes gateway restart")
 
 
+def _standalone_client(extra: Optional[dict]) -> NextcloudTalkClient:
+    """Build a Talk client from this profile's config (env -> YAML extra), mirroring the adapter."""
+    url = _cfg(extra, "NEXTCLOUD_TALK_URL", "url", "")
+    username = _cfg(extra, "NEXTCLOUD_TALK_USERNAME", "username", "")
+    password = _cfg(extra, "NEXTCLOUD_TALK_PASSWORD", "password", "")
+    if not (url and username and password):
+        raise ValueError(
+            "NEXTCLOUD_TALK_URL / NEXTCLOUD_TALK_USERNAME / NEXTCLOUD_TALK_PASSWORD are not configured"
+        )
+    return NextcloudTalkClient(url, username, password)
+
+
+async def _nc_standalone_send(
+    pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
+    media_files: Optional[list] = None, force_document: bool = False,
+) -> Dict[str, Any]:
+    """Out-of-process cron delivery: send via the Talk REST API without a live gateway adapter.
+
+    Text goes to the chat endpoint; media files are uploaded to Nextcloud Files and shared
+    into the room (same path the live adapter uses). ``thread_id``/``force_document`` have
+    no Talk equivalent and are ignored."""
+    try:
+        extra = getattr(pconfig, "extra", {}) or {}
+        client = _standalone_client(extra)
+        warnings: List[str] = []
+        text = (message or "").strip()
+        message_id: Any = None
+        if text:
+            sent = await client.send_message(chat_id, text)
+            if isinstance(sent, dict):
+                message_id = sent.get("id")
+        valid_media = [
+            path for path, _is_voice in (media_files or []) if path
+        ]
+        for media_path in valid_media:
+            if not os.path.exists(media_path):
+                warnings.append(f"media file missing: {media_path}")
+                continue
+            folder = _cfg(extra, "NEXTCLOUD_TALK_UPLOAD_FOLDER", "upload_folder", "/Hermes Uploads")
+            await client.upload_and_share_file(media_path, chat_id, folder)
+        if not text and not (media_files and valid_media):
+            return {"error": "Nextcloud Talk standalone send: empty message and no media"}
+        result: Dict[str, Any] = {"success": True}
+        if message_id is not None:
+            result["message_id"] = message_id
+        if warnings:
+            result["warnings"] = warnings
+        return result
+    except NextcloudTalkAPIError as exc:
+        return {"error": f"Nextcloud Talk standalone send failed: {_safe_outward_error_text(exc)}"}
+    except Exception as exc:  # keep cron delivery failures structured, never raise past the sender
+        return {"error": f"Nextcloud Talk standalone send failed ({type(exc).__name__})"}
+
+
 def register(ctx) -> None:
     ctx.register_platform(
         name="nextcloud_talk",
@@ -5998,6 +6172,7 @@ def register(ctx) -> None:
         emoji="☁️",
         allow_update_command=True,
         cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
+        standalone_sender_fn=_nc_standalone_send,
         platform_hint=(
             "You are chatting via Nextcloud Talk (multi-room). Talk renders Markdown: bold, lists, "
             "code blocks, links and simple tables work; images are shown as link previews. "

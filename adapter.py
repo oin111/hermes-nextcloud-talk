@@ -152,7 +152,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.11"
+_RELEASED_VERSION = "0.1.12"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -198,6 +198,28 @@ _DEFAULT_ACK_RETENTION_COUNT = 4096
 _DEFAULT_ACK_OVERLAP_IDS = _DEFAULT_MAX_POLL_BATCH - 1
 _DEFAULT_PROCESSING_TIMEOUT = 300.0
 _ACK_STATE_VERSION = 2
+# Cursor files written by this ledger mark their floors as contiguous-prefix
+# floors. Files without the marker (0.1.11 and earlier) are normalized once on
+# load with the historical overlap rule, which is what those releases ran.
+_ACK_FLOOR_MODE = "prefix"
+# A message ID joins the floor only after it has been visible this long, so a
+# lower ID committed a moment late by the Talk database is not skipped.
+_DEFAULT_FLOOR_SETTLE_SECONDS = 30.0
+# A dispatched message that keeps failing is retried with backoff and then
+# given up with a warning, so one failing turn neither re-runs forever nor
+# blocks the room's floor.
+_DEFAULT_MAX_DISPATCH_ATTEMPTS = 5
+# Reply delivery failures get a longer, still finite budget: GET polling works
+# (otherwise nothing is retried), so repeated POST failures are usually
+# deterministic (read-only room, lost chat permission) or a short rate limit.
+# With the backoff below 8 attempts span about an hour.
+_DEFAULT_MAX_DELIVERY_ATTEMPTS = 8
+
+
+def _ledger_clock() -> float:
+    """Clock for settle/backoff bookkeeping (patchable in tests)."""
+    return time.monotonic()
+_RETRY_BACKOFF_SECONDS = (0.0, 60.0, 300.0, 900.0)
 _STREAM_CHUNK_SIZE = 64 * 1024
 _MAX_ERROR_BYTES = 4096
 _MAX_DAV_PATH_LENGTH = 2048
@@ -320,6 +342,10 @@ def _secure_base_url(url: str, allow_insecure: bool = False) -> bool:
         return loopback or allow_insecure
     except (TypeError, ValueError):
         return False
+
+
+class _OutcomeAlreadyRecorded(RuntimeError):
+    """A waited-for turn failed; on_processing_complete already accounted it."""
 
 
 class NextcloudTalkAPIError(RuntimeError):
@@ -1618,6 +1644,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 self.ack_retention_count, self.ack_overlap_ids, self.ack_overlap_ids,
             )
             self.ack_retention_count = self.ack_overlap_ids
+        self.max_dispatch_attempts = max(1, int(_cfg(
+            extra, "NEXTCLOUD_TALK_MAX_DISPATCH_ATTEMPTS", "max_dispatch_attempts",
+            _DEFAULT_MAX_DISPATCH_ATTEMPTS,
+        )))
+        self.max_delivery_attempts = max(1, int(_cfg(
+            extra, "NEXTCLOUD_TALK_MAX_DELIVERY_ATTEMPTS", "max_delivery_attempts",
+            _DEFAULT_MAX_DELIVERY_ATTEMPTS,
+        )))
+        self.floor_settle_seconds = max(0.0, float(_cfg(
+            extra, "NEXTCLOUD_TALK_FLOOR_SETTLE_SECONDS", "floor_settle_seconds",
+            _DEFAULT_FLOOR_SETTLE_SECONDS,
+        )))
         self._cursor_path = get_hermes_home() / "cache" / "nextcloud_talk" / "cursors.json"
         self._last_discovery_at = 0.0
         self._running = False
@@ -1944,7 +1982,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         "active": state.get("active") is True,
                     }
                     self._ack_seen_counter = max(self._ack_seen_counter, last_seen)
-                    if self._normalize_ack_state(self._ack_rooms[token]):
+                    legacy = payload.get("floor_mode") != _ACK_FLOOR_MODE
+                    if self._normalize_ack_state(self._ack_rooms[token], legacy_overlap=legacy):
+                        self._ack_state_dirty = True
+                    if legacy:
                         self._ack_state_dirty = True
                     self._sync_legacy_cursor(token)
             elif (
@@ -1997,6 +2038,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         "successful": set(),
                         "initialized": False,
                     }
+        if not hasattr(self, "_room_seen_ids"):
+            self._room_seen_ids = {}
+        if not hasattr(self, "_scan_resume"):
+            self._scan_resume = {}
+        if not hasattr(self, "_poll_page_limits"):
+            self._poll_page_limits = {}
+        if not hasattr(self, "_sweep_completed_from"):
+            self._sweep_completed_from = {}
+        if not hasattr(self, "_dispatch_attempts"):
+            self._dispatch_attempts = {}
+        if not hasattr(self, "_retry_not_before"):
+            self._retry_not_before = {}
         if not hasattr(self, "_inflight_message_ids"):
             self._inflight_message_ids = {}
         if not hasattr(self, "_initializing_rooms"):
@@ -2113,19 +2166,34 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._ack_rooms.pop(token, None)
             self._last_message_ids.pop(token, None)
 
-    def _normalize_ack_state(self, state: Dict[str, Any]) -> bool:
-        """Compact one room while retaining exact ACKs in the overlap window."""
+    def _normalize_ack_state(self, state: Dict[str, Any], *, legacy_overlap: bool = False) -> bool:
+        """Drop exact ACKs the floor already covers; bound the exact set.
+
+        ``legacy_overlap`` applies the 0.1.11 rule (floor = highest ACK minus
+        the overlap window) once, to cursor files that release wrote: that was
+        the contract they ran under, so it neither replays nor skips anything
+        0.1.11 would not have. The prefix ledger itself only advances the floor
+        over IDs proven contiguous in the room's own history.
+        """
         floor = int(state.get("floor", 0))
         successful = set(state.get("successful", set()))
         original_floor = floor
         original_successful = set(successful)
-        if successful:
+        if legacy_overlap and successful:
             floor = max(floor, max(successful) - self.ack_overlap_ids)
         successful = {value for value in successful if value > floor}
         if len(successful) > self.ack_retention_count:
+            # Only reachable after a floor stall far larger than any poll page;
+            # keep the newest exact ACKs and surface it rather than growing
+            # without bound.
             kept = sorted(successful)[-self.ack_retention_count:]
+            old_floor = floor
             floor = max(floor, kept[0] - 1)
             successful = set(kept)
+            logger.warning(
+                "[nextcloud_talk] Exact ACK retention exceeded; floor advanced from %d to %d "
+                "and any unacknowledged ID in that range is given up", old_floor, floor,
+            )
         state["floor"] = floor
         state["successful"] = successful
         return floor != original_floor or successful != original_successful
@@ -2140,6 +2208,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._prune_ack_rooms()
         return {
             "version": _ACK_STATE_VERSION,
+            "floor_mode": _ACK_FLOOR_MODE,
             "rooms": {
                 token: {
                     "floor": int(state.get("floor", 0)),
@@ -2306,15 +2375,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             }
             successful = set(old_successful)
             successful.add(numeric_id)
-            highest = max(successful)
-            new_floor = max(floor, highest - self.ack_overlap_ids)
-            successful = {value for value in successful if value > new_floor}
-            if len(successful) > self.ack_retention_count:
-                kept = sorted(successful)[-self.ack_retention_count:]
-                new_floor = max(new_floor, kept[0] - 1)
-                successful = set(kept)
-            state["floor"] = new_floor
+            state["floor"] = floor
             state["successful"] = successful
+            self._advance_floor(room_token, state)
+            self._normalize_ack_state(state)
+            self._prune_retry_state(room_token, int(state["floor"]))
+            self._dispatch_attempts.get(room_token, {}).pop(numeric_id, None)
+            self._retry_not_before.get(room_token, {}).pop(numeric_id, None)
             self._touch_ack_room(
                 room_token,
                 active=room_token in set(getattr(self, "room_tokens", [])),
@@ -2334,6 +2401,137 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     self._last_message_ids.pop(room_token, None)
                 raise
 
+    def _observe_room_ids(self, room_token: str, ids: Any) -> None:
+        """Record message IDs the server has shown for this room (volatile).
+
+        Talk IDs are global and sparse; a room's own history is the only proof
+        that no unseen ID lies between two ACKed ones. The first-seen time lets
+        the floor wait out IDs the database commits slightly out of order.
+        """
+        seen = self._room_seen_ids.setdefault(room_token, {})
+        now = _ledger_clock()
+        for value in ids:
+            message_id = _strict_talk_message_id(value)
+            if message_id is not None and message_id not in seen:
+                seen[message_id] = now
+        limit = max(4 * int(self.ack_retention_count), 1024)
+        if len(seen) > limit:
+            floor = int(self._ack_rooms.get(room_token, {}).get("floor", 0))
+            for message_id in [m for m in seen if m <= floor]:
+                del seen[message_id]
+            if len(seen) > limit:
+                for message_id in sorted(seen)[: len(seen) - limit]:
+                    del seen[message_id]
+
+    def _advance_floor(self, room_token: str, state: Dict[str, Any]) -> bool:
+        """Advance the floor over the contiguous ACKed prefix of observed history.
+
+        A room ID above the floor joins it only when it is exactly ACKed (or
+        given up after bounded retries) AND every lower observed ID already
+        did, AND it has been visible for the settle window. An unacknowledged
+        ID stops the walk, so it stays retryable; nothing unseen is skipped.
+        """
+        seen = self._room_seen_ids.get(room_token)
+        if not seen:
+            return False
+        floor = int(state.get("floor", 0))
+        successful = state.get("successful", set())
+        settle = float(getattr(self, "floor_settle_seconds", _DEFAULT_FLOOR_SETTLE_SECONDS))
+        if settle > 0:
+            # An ID is settled only once a sweep that started from the floor
+            # at least ``settle`` after the ID was first seen has completed:
+            # that sweep would have shown any lower ID committed late.
+            horizon = self._sweep_completed_from.get(room_token)
+            if horizon is None:
+                return False
+            horizon -= settle
+        else:
+            horizon = float("inf")
+        new_floor = floor
+        for message_id in sorted(m for m in seen if m > floor):
+            if message_id not in successful:
+                break
+            if seen[message_id] > horizon:
+                break
+            new_floor = message_id
+        if new_floor == floor:
+            return False
+        state["floor"] = new_floor
+        state["successful"] = {m for m in successful if m > new_floor}
+        self._prune_retry_state(room_token, new_floor)
+        return True
+
+    def _prune_retry_state(self, room_token: str, floor: int) -> None:
+        for name in ("_dispatch_attempts", "_retry_not_before"):
+            per_room = getattr(self, name, {}).get(room_token)
+            if per_room:
+                for message_id in [m for m in per_room if m <= floor]:
+                    del per_room[message_id]
+
+    def _settle_room_floor(self, room_token: str) -> None:
+        """Persist a floor advance that became possible only as time passed."""
+        state = self._ack_rooms.get(room_token)
+        if not state:
+            return
+        lock = getattr(self, "_cursor_lock", None)
+        if lock is None:
+            lock = self._cursor_lock = threading.RLock()
+        with lock:
+            snapshot = (int(state.get("floor", 0)), set(state.get("successful", set())))
+            if not self._advance_floor(room_token, state):
+                return
+            self._sync_legacy_cursor(room_token)
+            try:
+                self._persist_cursors()
+                self._ack_state_dirty = False
+            except Exception:
+                state["floor"], state["successful"] = snapshot
+                self._sync_legacy_cursor(room_token)
+                raise
+
+    def _record_dispatch_failure(
+        self, room_token: str, numeric_id: int, *, delivery: bool = False
+    ) -> None:
+        """Back off a failed turn; give it up after bounded attempts.
+
+        Giving up acknowledges the ID with a warning: one message whose
+        handler, tools or attachments keep failing must neither re-run the
+        agent forever nor pin the floor. A failed reply delivery
+        (``delivery=True``) gets the separate, larger
+        ``max_delivery_attempts`` budget: the user has not been answered, so a
+        short POST outage must not drop the message, yet a reply Talk will
+        never accept must not re-run the agent forever.
+        """
+        attempts = self._dispatch_attempts.setdefault(room_token, {})
+        count = attempts.get(numeric_id, 0) + 1
+        attempts[numeric_id] = count
+        if delivery:
+            limit = int(getattr(self, "max_delivery_attempts", _DEFAULT_MAX_DELIVERY_ATTEMPTS))
+        else:
+            limit = int(getattr(self, "max_dispatch_attempts", _DEFAULT_MAX_DISPATCH_ATTEMPTS))
+        if count >= limit:
+            logger.warning(
+                "[nextcloud_talk] Giving up message %s in room %s after %d failed attempts",
+                numeric_id, self._safe_room_token(room_token), count,
+            )
+            attempts.pop(numeric_id, None)
+            self._retry_not_before.get(room_token, {}).pop(numeric_id, None)
+            self._commit_cursor(room_token, numeric_id)
+            return
+        backoff = tuple(getattr(self, "retry_backoff_seconds", _RETRY_BACKOFF_SECONDS)) or (0.0,)
+        delay = float(backoff[min(count - 1, len(backoff) - 1)])
+        if delay > 0:
+            self._retry_not_before.setdefault(room_token, {})[numeric_id] = _ledger_clock() + delay
+
+    def _drop_volatile_room_state(self, room_token: str) -> None:
+        for name in ("_room_seen_ids", "_scan_resume", "_dispatch_attempts",
+                     "_retry_not_before", "_poll_page_limits", "_sweep_completed_from"):
+            getattr(self, name, {}).pop(room_token, None)
+
+    def _retry_deferred(self, room_token: str, numeric_id: int) -> bool:
+        due = self._retry_not_before.get(room_token, {}).get(numeric_id)
+        return due is not None and _ledger_clock() < due
+
     def _is_acknowledged(self, room_token: str, numeric_id: int) -> bool:
         numeric_id = _strict_talk_message_id(numeric_id)
         if numeric_id is None:
@@ -2351,13 +2549,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         floor = 0 if type(raw_floor) is int and raw_floor == 0 else _strict_talk_message_id(raw_floor)
         if floor is None:
             return None
-        successful = {
-            message_id for value in state.get("successful", set())
-            if (message_id := _strict_talk_message_id(value)) is not None
-        }
-        if not successful:
-            return floor
-        return max(floor, max(successful) - self.ack_overlap_ids)
+        # Rescan from the proven prefix; exact ACKs above it are deduplicated.
+        # Scanning stays bounded because the floor follows the room's own
+        # contiguous history (see _advance_floor).
+        return floor
 
     def _is_room_initialized(self, room_token: str) -> bool:
         self._ensure_ack_runtime()
@@ -2445,6 +2640,39 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             ordered_ids = ordered_ids[-limit:]
         return [collected[message_id] for message_id in ordered_ids]
 
+    def _establish_backlog_floor(self, room_token: str, backlog_ids: List[int]) -> None:
+        """First sight of a room: history older than the backlog window is handled.
+
+        Without this the prefix floor would start at 0 and the whole room
+        history would be dispatched as new turns.
+        """
+        state = self._ack_rooms.get(room_token)
+        if state is not None and (int(state.get("floor", 0)) or state.get("successful")):
+            return
+        if not backlog_ids:
+            return
+        lock = getattr(self, "_cursor_lock", None)
+        if lock is None:
+            lock = self._cursor_lock = threading.RLock()
+        with lock:
+            existed = state is not None
+            state = self._ack_rooms.setdefault(room_token, {
+                "floor": 0, "successful": set(), "initialized": False, "last_seen": 0,
+                "active": room_token in set(getattr(self, "room_tokens", [])),
+            })
+            state["floor"] = max(int(state.get("floor", 0)), min(backlog_ids) - 1)
+            self._touch_ack_room(room_token, active=room_token in set(getattr(self, "room_tokens", [])))
+            self._sync_legacy_cursor(room_token)
+            try:
+                self._persist_cursors()
+            except Exception:
+                if existed:
+                    state["floor"] = 0
+                else:
+                    self._ack_rooms.pop(room_token, None)
+                    self._last_message_ids.pop(room_token, None)
+                raise
+
     async def _initialize_room(self, room_token: str) -> None:
         self._ensure_ack_runtime()
         self._initializing_rooms.add(room_token)
@@ -2454,13 +2682,38 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 # Explicit opt-out: establish a cursor at latest, with a visible warning.
                 latest = await self._fetch_initial_backlog(room_token, 1)
                 if latest:
-                    self._commit_cursor(room_token, _strict_talk_message_id(latest[-1].get("id")))
+                    latest_id = _strict_talk_message_id(latest[-1].get("id"))
+                    if latest_id is not None:
+                        self._establish_backlog_floor(room_token, [latest_id + 1])
                 logger.warning("[nextcloud_talk] Initial backlog disabled for room %s", self._safe_room_token(room_token))
                 self._mark_room_initialized(room_token)
                 return
+            backlog_ids = [
+                message_id for message in messages
+                if isinstance(message, dict)
+                and (message_id := _strict_talk_message_id(message.get("id"))) is not None
+            ]
+            # The fetched window (bounded backlog, or the capped full backfill
+            # of PROCESS_HISTORY) is everything this room will ever dispatch
+            # from before its first sight; older history is handled.
+            self._establish_backlog_floor(room_token, backlog_ids)
+            self._observe_room_ids(room_token, backlog_ids)
             for message in messages:
-                await self._handle_talk_message(message, room_token, await_completion=True)
                 message_id = _strict_talk_message_id(message.get("id"))
+                try:
+                    await self._handle_talk_message(message, room_token, await_completion=True)
+                except asyncio.CancelledError:
+                    raise
+                except _OutcomeAlreadyRecorded:
+                    pass
+                except Exception:
+                    # Not accounted by on_processing_complete (e.g. the awaited
+                    # turn timed out): count it so a backlog turn that never
+                    # finishes is given up instead of blocking the room forever.
+                    if message_id is not None:
+                        self._record_dispatch_failure(room_token, message_id)
+                    if message_id is None or not self._is_acknowledged(room_token, message_id):
+                        raise
                 if message_id is not None and not self._is_acknowledged(room_token, message_id):
                     # A removed/re-added room may still own an accepted handler.
                     # Deduplication alone is not proof that this backlog item finished.
@@ -2575,6 +2828,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 ack_activity_changed = True
         for token in removed_tokens:
             self._room_types.pop(token, None)
+            self._drop_volatile_room_state(token)
             state = self._ack_rooms.get(token)
             if state is not None and state.get("active") is not False:
                 self._touch_ack_room(token, active=False)
@@ -2606,13 +2860,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 return
             max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
             poll_anchor = self._poll_anchor(room_token)
-            messages = await self._client.get_messages(
-                room_token,
-                last_known_id=poll_anchor,
-                look_into_future=True,
-                timeout=self.poll_timeout,
-                limit=max_batch,
-            )
 
             def normalize_batch(batch: Any) -> tuple[Dict[int, dict], int, List[int]]:
                 if not isinstance(batch, list):
@@ -2631,33 +2878,120 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         malformed_count += 1
                         continue
                     valid_ids.append(message_id)
-                    if not self._is_acknowledged(room_token, message_id):
+                    if (not self._is_acknowledged(room_token, message_id)
+                            and not self._retry_deferred(room_token, message_id)):
                         normalized_batch[message_id] = msg
+                self._observe_room_ids(room_token, valid_ids)
                 return normalized_batch, malformed_count, valid_ids
 
-            normalized, malformed, valid_ids = normalize_batch(messages)
-            if messages and not normalized and not malformed and valid_ids:
-                live_anchor = max(valid_ids)
-                if poll_anchor is None or live_anchor > poll_anchor:
-                    messages = await self._client.get_messages(
-                        room_token,
-                        last_known_id=live_anchor,
-                        look_into_future=True,
-                        timeout=self.poll_timeout,
-                        limit=max_batch,
-                    )
-                    normalized, malformed, _ = normalize_batch(messages)
-            if malformed:
+            cycle_dispatched: set[int] = set()
+
+            async def dispatch(batch: Dict[int, dict]) -> None:
+                for message_id in sorted(batch):
+                    # One dispatch per ID per poll cycle, even if a page repeats.
+                    if message_id in cycle_dispatched:
+                        continue
+                    cycle_dispatched.add(message_id)
+                    try:
+                        await self._handle_talk_message(batch[message_id], room_token)
+                    except asyncio.CancelledError:
+                        raise
+                    except _OutcomeAlreadyRecorded:
+                        continue
+                    except Exception as exc:
+                        # e.g. an attachment download that keeps failing. It
+                        # must not abort the page (newer messages would starve)
+                        # nor retry forever; count it like a failed turn.
+                        logger.warning(
+                            "[nextcloud_talk] Message %s in room %s failed before dispatch: %s",
+                            message_id, self._safe_room_token(room_token),
+                            _safe_outward_error_text(exc),
+                        )
+                        self._record_dispatch_failure(room_token, message_id)
+
+            async def fetch(last_known_id: Optional[int], timeout: int) -> List[dict]:
+                # A page larger than max_json_bytes (a few huge messages) is
+                # retried with a smaller page instead of failing the room.
+                limit = self._poll_page_limits.get(room_token, max_batch)
+                while True:
+                    try:
+                        page = await self._client.get_messages(
+                            room_token, last_known_id=last_known_id, look_into_future=True,
+                            timeout=timeout, limit=limit,
+                        )
+                    except NextcloudTalkAPIError as exc:
+                        if exc.category != "overflow" or limit <= 1:
+                            raise
+                        limit = max(1, limit // 2)
+                        self._poll_page_limits[room_token] = limit
+                        logger.warning(
+                            "[nextcloud_talk] Poll page too large in room %s; retrying with %d messages",
+                            self._safe_room_token(room_token), limit,
+                        )
+                        continue
+                    if limit < max_batch and len(page) < limit:
+                        # Recover the normal page size once past the large messages.
+                        self._poll_page_limits.pop(room_token, None)
+                    return page
+
+            # Catch up from the proven prefix without waiting: acknowledged or
+            # backed-off IDs above the floor are skipped, and full pages are
+            # followed (bounded) so newer messages are never starved behind them.
+            # A sweep longer than one cycle's page budget resumes where it
+            # stopped (volatile); only a completed sweep restarts at the floor,
+            # so a backed-off lower ID is revisited and nothing is starved.
+            resume = self._scan_resume.get(room_token)
+            if resume is None or (poll_anchor or 0) >= resume[0]:
+                anchor = poll_anchor
+                sweep_started = _ledger_clock()
+            else:
+                anchor, sweep_started = resume
+            highest_seen = anchor
+            dispatched = False
+            malformed_total = 0
+            pages = 0
+            for pages in range(1, 33):
+                messages = await fetch(anchor, 0)
+                normalized, malformed, valid_ids = normalize_batch(messages)
+                malformed_total += malformed
+                if valid_ids:
+                    highest_seen = max(valid_ids) if highest_seen is None else max(highest_seen, max(valid_ids))
+                if valid_ids and anchor is not None and max(valid_ids) <= anchor:
+                    logger.warning("[nextcloud_talk] Poll page made no progress in room %s",
+                                   self._safe_room_token(room_token))
+                    self._scan_resume.pop(room_token, None)
+                    break
+                if normalized:
+                    # Dispatch and keep sweeping: ending the sweep here would
+                    # mean a room with steady traffic never completes one, so
+                    # its floor would never settle.
+                    await dispatch(normalized)
+                    dispatched = True
+                if not valid_ids:
+                    # Only an empty page proves the sweep ended: Talk drops
+                    # invisible messages after applying the page limit, so a
+                    # short page can still have newer messages behind it.
+                    self._scan_resume.pop(room_token, None)
+                    self._sweep_completed_from[room_token] = sweep_started
+                    break
+                anchor = max(valid_ids)
+            else:
+                self._scan_resume[room_token] = (anchor, sweep_started)
+            if room_token not in self._scan_resume:
+                # Caught up (sweep completed or dispatched to its end): long-poll
+                # for genuinely new messages from the newest ID seen, so an idle
+                # room waits instead of rescanning.
+                messages = await fetch(highest_seen, self.poll_timeout)
+                normalized, malformed, _ = normalize_batch(messages)
+                malformed_total += malformed
+                await dispatch(normalized)
+            if malformed_total:
                 logger.warning(
                     "[nextcloud_talk] Ignored %d poll message(s) with malformed/missing IDs in room %s",
-                    malformed, self._safe_room_token(room_token),
+                    malformed_total, self._safe_room_token(room_token),
                 )
-            for message_id in sorted(normalized):
-                msg = normalized[message_id]
-                await self._handle_talk_message(msg, room_token)
-            # Rate-limit: if we got a full batch (say >5), delay slightly so we don't
-            # DOS the server on backlog catch-up
-            if len(messages) > 5:
+            self._settle_room_floor(room_token)
+            if pages > 1 or len(messages) > 5:
                 await asyncio.sleep(0.5)
         except NextcloudTalkAPIError as exc:
             if exc.status_code == 304:
@@ -2975,6 +3309,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._ensure_ack_runtime()
         if self._is_acknowledged(room_token, numeric_id):
             return
+        if self._retry_deferred(room_token, numeric_id):
+            return
         inflight = self._inflight_message_ids.setdefault(room_token, set())
         if numeric_id in inflight:
             return
@@ -3249,6 +3585,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except asyncio.TimeoutError as exc:
                 if generation_key is not None:
                     self._finish_without_ack(event, room_token, numeric_id, generation)
+                # on_processing_complete did not run: let the caller count it.
                 raise RuntimeError(
                     "Nextcloud Talk startup message processing timed out"
                 ) from exc
@@ -3256,7 +3593,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 ProcessingOutcome.SUCCESS, "value", str(ProcessingOutcome.SUCCESS)
             )
             if event.metadata.get("nextcloud_talk_processing_outcome") != expected_success:
-                raise RuntimeError("Nextcloud Talk startup message processing failed")
+                raise _OutcomeAlreadyRecorded("Nextcloud Talk startup message processing failed")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
         """Commit Talk input only for the authoritative dispatch generation."""
@@ -3292,6 +3629,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except BaseException as exc:
                 effective_outcome = ProcessingOutcome.FAILURE
                 hook_error = exc
+        elif effective_outcome == ProcessingOutcome.FAILURE:
+            # Only a turn that actually ran and failed counts; cancellation,
+            # busy deferral and watchdog release stay plain retryable. A turn
+            # whose handler succeeded but whose reply/attachment delivery
+            # failed uses the larger delivery budget.
+            handler_ok = metadata.get("nextcloud_talk_handler_state") == "success"
+            try:
+                self._record_dispatch_failure(room_token, numeric_id, delivery=handler_ok)
+            except Exception as exc:
+                logger.warning("[nextcloud_talk] Could not record failed attempt: %s",
+                               _safe_outward_error_text(exc))
         metadata["nextcloud_talk_processing_outcome"] = getattr(
             effective_outcome, "value", str(effective_outcome)
         )

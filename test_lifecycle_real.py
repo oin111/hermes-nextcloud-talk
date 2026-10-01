@@ -888,32 +888,27 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 await self.wait_for_background(instance)
             self.assertEqual(seen, [8, 7])
 
-    def test_effective_overlap_retains_exact_ack_without_flooring_recent_delayed_id(self):
+    def test_exact_ack_state_stays_bounded_with_a_delayed_id(self):
+        # 5000 IDs observed in history, one delayed: the floor stops right below
+        # it, and the exact set holds only what lies above, never all history.
         delayed_id = 4900
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)
-            instance.ack_overlap_ids = 199
-            instance.ack_retention_count = 2048
-            instance.max_poll_batch = 200
+            instance.floor_settle_seconds = 0.0
             instance._ensure_ack_runtime()
             instance._persist_cursors = lambda: None
-
+            instance._observe_room_ids("room", range(1, 5001))
             for message_id in range(1, 5001):
                 if message_id != delayed_id:
                     instance._commit_cursor("room", message_id)
-
             state = instance._ack_rooms["room"]
-            self.assertEqual(instance.ack_retention_count, 2048)
-            self.assertEqual(state["floor"], 4801)
+            self.assertEqual(state["floor"], delayed_id - 1)
             self.assertFalse(instance._is_acknowledged("room", delayed_id))
-            self.assertEqual(instance._poll_anchor("room"), 4801)
-            self.assertEqual(len(state["successful"]), 198)
-
+            self.assertEqual(instance._poll_anchor("room"), delayed_id - 1)
+            self.assertEqual(len(state["successful"]), 100)
             instance._commit_cursor("room", delayed_id)
-            self.assertTrue(instance._is_acknowledged("room", delayed_id))
-            before = set(state["successful"])
-            instance._commit_cursor("room", delayed_id)
-            self.assertEqual(state["successful"], before)
+            self.assertEqual(state["floor"], 5000)
+            self.assertEqual(state["successful"], set())
 
     def test_legacy_oversized_overlap_normalizes_and_persists_on_restart(self):
         delayed_id = 4900
@@ -1142,8 +1137,10 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 def __init__(self):
                     self.calls = 0
 
-                async def get_messages(self, *_args, **_kwargs):
+                async def get_messages(self, *_args, last_known_id=None, **_kwargs):
                     self.calls += 1
+                    if last_known_id is not None and last_known_id >= 101:
+                        return []
                     return [{**_MESSAGE, "id": 101, "message": "1"}]
 
             client = Client()
@@ -1151,7 +1148,9 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             instance.set_message_handler(handler)
             try:
                 await asyncio.wait_for(instance._poll_room("room"), timeout=1)
-                self.assertEqual(client.calls, 1)
+                # Page with the reply, the empty page that completes the sweep,
+                # then the long poll; the reply is dispatched exactly once.
+                self.assertEqual(client.calls, 3)
                 self.assertEqual(observed, ["1"])
                 self.assertTrue(clarify_entry.event.is_set())
                 self.assertFalse(instance._source_has_pending_clarify(source))

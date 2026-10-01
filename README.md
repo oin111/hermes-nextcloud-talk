@@ -167,6 +167,9 @@ NEXTCLOUD_TALK_MAX_ACK_ROOMS=800
 NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES=10000
 NEXTCLOUD_TALK_ACK_RETENTION_COUNT=4096
 NEXTCLOUD_TALK_ACK_OVERLAP_IDS=199
+NEXTCLOUD_TALK_FLOOR_SETTLE_SECONDS=30
+NEXTCLOUD_TALK_MAX_DISPATCH_ATTEMPTS=5
+NEXTCLOUD_TALK_MAX_DELIVERY_ATTEMPTS=8
 NEXTCLOUD_TALK_PROCESSING_TIMEOUT=300
 NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK=false
 ```
@@ -178,13 +181,42 @@ trusted test network.
 
 Room ACK ledgers are persisted atomically with mode `0600` under the active profile's
 Hermes cache. A message is acknowledged only after deterministic pre-dispatch ignore
-or a real Hermes `ProcessingOutcome.SUCCESS`; handler, tool, delivery, cancellation,
-and shutdown failures remain retryable. The ledger retains up to 4,096 successful IDs
-and polls with a 199-ID overlap inside the default 200-message response page, so delayed
-lower Talk IDs are deduplicated without starving newer messages behind acknowledged
-history. Both bounds are configurable above; overlap is clamped to one less than the
-poll batch size, retention is clamped upward to overlap if configured lower, and messages
-delayed beyond the effective overlap are outside the retention guarantee.
+or a real Hermes `ProcessingOutcome.SUCCESS`; cancellation and shutdown leave it
+retryable.
+
+Each room keeps a **prefix floor** plus exact ACKs above it. The floor advances only
+over message IDs the adapter has actually seen in that room's own history, each of
+them acknowledged, and only after a complete rescan from the floor that started at
+least `NEXTCLOUD_TALK_FLOOR_SETTLE_SECONDS` (30 s) after the ID was first seen. A lower
+ID the server commits or reveals late is therefore still dispatched, and an
+unacknowledged ID stops the floor right below itself. Polling rescans from the floor
+without waiting, follows full pages, resumes a long sweep across cycles, and only
+then long-polls for new messages; the exact set therefore holds just the IDs above
+the floor, not the room's history, and a room never stalls on a size cap.
+`NEXTCLOUD_TALK_ACK_RETENTION_COUNT` (4,096) is only a safety bound: if more than that
+many exact ACKs pile up above a message that is still being retried (for example
+4,096 newer messages during its backoff), the floor passes it and it is given up with
+a warning naming the range.
+
+A message whose agent turn fails (handler or tool error) or that fails before
+dispatch (for example an attachment download that keeps failing) is retried with
+backoff (immediately, 1 min, 5 min, 15 min) and given up with a warning after
+`NEXTCLOUD_TALK_MAX_DISPATCH_ATTEMPTS` (5), so it neither re-runs forever nor blocks
+newer messages. A turn whose reply Talk refused gets the larger
+`NEXTCLOUD_TALK_MAX_DELIVERY_ATTEMPTS` budget (8, about an hour with that backoff),
+so a short outage does not drop it, while a reply Talk will never accept (read-only
+room, lost chat permission) does not re-run the agent forever. Each retry re-runs the
+agent turn. Attempt counters are kept in memory and restart with the gateway.
+A poll page larger than `NEXTCLOUD_TALK_MAX_JSON_BYTES` is fetched again with smaller
+pages instead of failing the room; a single message above that limit still blocks
+the room until the limit is raised (not reachable with the 4 MiB default). With
+`NEXTCLOUD_TALK_PROCESS_HISTORY=true` the backfill is still capped by
+`NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES`; history older than the capped backfill is
+treated as handled.
+Cursor files written by 0.1.11 or earlier are
+adopted once with that release's overlap rule (floor = highest ACK minus
+`NEXTCLOUD_TALK_ACK_OVERLAP_IDS`), which neither replays nor skips anything it would
+not have, and are rewritten in prefix mode.
 Inactive room ACK history is LRU-bounded by `NEXTCLOUD_TALK_MAX_ACK_ROOMS` (800 by
 default, and never lower than `NEXTCLOUD_TALK_MAX_ROOMS`); configured, discovered,
 initializing, and in-flight rooms are not evicted. `NEXTCLOUD_TALK_PROCESSING_TIMEOUT`
@@ -204,7 +236,8 @@ failed/unprocessed IDs after refresh or restart. Legacy scalar cursor JSON is mi
 conservatively as uninitialized and written in the versioned ledger format on the next
 ACK. On a first-ever installation/new room, the newest
 `NEXTCLOUD_TALK_INITIAL_BACKLOG_LIMIT` messages are processed (50 by default), avoiding
-both silent offline loss and an unbounded ancient replay. Set the limit to `0` only to
+both silent offline loss and an unbounded ancient replay: the room's floor starts just
+below that window, so older history is never dispatched. Set the limit to `0` only to
 explicitly skip existing history (a warning is logged), or set legacy
 `NEXTCLOUD_TALK_PROCESS_HISTORY=true` for an unlimited, paginated first-run backfill.
 Even in legacy history mode, `NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES` is a hard
@@ -350,7 +383,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.11 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.12 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

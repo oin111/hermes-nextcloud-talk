@@ -2,6 +2,61 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.12] - 2026-09-30 (UTC)
+
+### Changed
+
+- Room ACK ledgers use a bounded **prefix floor**: the floor advances only over IDs
+  seen in the room's own history that are acknowledged and have been visible for a
+  short settle window (`NEXTCLOUD_TALK_FLOOR_SETTLE_SECONDS`, 30 s). Exact ACKs are
+  kept only above the floor. An unacknowledged ID now stays retryable no matter how
+  much newer traffic follows it; 0.1.11 dropped it from its overlap window after 199
+  newer IDs.
+- Polling catches up from the floor without waiting, follows full pages, resumes a
+  long sweep across poll cycles, and long-polls only once caught up.
+- A turn whose handler or tools fail, or a message that fails before dispatch (e.g. an
+  attachment download that keeps failing), is retried with backoff and given up with
+  a warning after `NEXTCLOUD_TALK_MAX_DISPATCH_ATTEMPTS` (5), without blocking newer
+  messages. 0.1.11 retried it on every poll forever and a failing attachment muted
+  the room. A turn whose reply Talk refused gets a separate, larger budget
+  (`NEXTCLOUD_TALK_MAX_DELIVERY_ATTEMPTS`, 8, about an hour).
+- A poll page larger than `NEXTCLOUD_TALK_MAX_JSON_BYTES` (a few huge messages) is
+  re-fetched with smaller pages; in 0.1.11 it muted the room.
+- A short poll page (Talk hides invisible messages after applying the page limit) no
+  longer ends the catch-up sweep early.
+
+### Fixed
+
+- A startup-backlog turn that outlives `NEXTCLOUD_TALK_PROCESSING_TIMEOUT` counts toward
+  the give-up budget; in 0.1.11 the room never finished initializing and the turn
+  (and its reply) re-ran on every retry.
+- `NEXTCLOUD_TALK_INITIAL_BACKLOG_LIMIT=0` really starts a new room at the latest
+  message, and a restart never replays history below the persisted floor.
+- With `NEXTCLOUD_TALK_PROCESS_HISTORY=true`, history older than the capped backfill
+  (`NEXTCLOUD_TALK_MAX_BACKLOG_MESSAGES`) is not replayed.
+
+### Known limits
+
+- The floor passes an ID only after a complete rescan from the floor that started at
+  least the settle window (30 s) after the ID was first seen; a lower ID revealed
+  later than that is not dispatched.
+- A single message larger than `NEXTCLOUD_TALK_MAX_JSON_BYTES` still blocks its room
+  (not reachable with the 4 MiB default), as in 0.1.11.
+
+### Compatibility
+
+- 0.1.11 cursor files load unchanged: their floors are adopted once with the 0.1.11
+  overlap rule and rewritten in prefix mode. No Hermes core changes are required.
+
+### Tests
+
+- `test_prefix_ledger`: real Hermes dispatch path; first-seen backlog window, backlog 0,
+  6,000 unauthorized messages without a stall or growing state, bounded retries of a
+  failing turn, bounded reply-delivery retries, the settle window
+  against a later sweep, single accounting of awaited failures, pre-dispatch errors, oversized pages,
+  capped history backfill, short pages, no starvation beyond one cycle of pages,
+  0.1.11 cursor adoption, and restart without replay.
+
 ## [0.1.11] - 2026-09-19 (UTC)
 
 ### Fixed

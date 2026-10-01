@@ -1836,118 +1836,109 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(seen, [("9", "plain Talk text")])
         self.assertEqual(instance._last_message_ids["dm-room"], 9)
 
-    async def test_poll_overlap_fits_page_and_reaches_newest_message(self):
-        seen = []
-        calls = []
+    def _prefix_room(self, acked, *, settle=0.0):
         instance = self.make_adapter(lambda event: asyncio.sleep(0))
         instance.max_poll_batch = 10
-        instance.poll_timeout = 1
-        instance.ack_overlap_ids = 9
-        instance.ack_retention_count = 32
+        instance.poll_timeout = 30
+        instance.floor_settle_seconds = settle
         instance._persist_cursors = lambda: None
-        for message_id in range(1, 101):
+        instance._ensure_ack_runtime()
+        for message_id in acked:
             instance._commit_cursor("dm-room", message_id)
+        return instance
+
+    async def test_poll_catches_up_from_prefix_across_full_pages_then_long_polls(self):
+        # 100 acknowledged IDs, never observed in this process: the scan starts
+        # at the proven prefix, pages without waiting, and only then long-polls.
+        instance = self._prefix_room(range(1, 101))
+        calls, seen = [], []
 
         async def get_messages(*_args, **kwargs):
-            anchor = kwargs["last_known_id"]
-            limit = kwargs["limit"]
-            calls.append((anchor, limit))
-            return [{"id": value} for value in range(anchor + 1, min(anchor + limit, 101) + 1)]
-
-        instance._client = types.SimpleNamespace(get_messages=get_messages)
+            anchor = kwargs["last_known_id"] or 0
+            calls.append((anchor, kwargs["timeout"]))
+            if kwargs["timeout"]:
+                return [{"id": 101}]
+            return [{"id": value} for value in range(anchor + 1, min(anchor + 10, 100) + 1)]
 
         async def record(msg, room):
-            seen.append((msg["id"], room))
-
-        instance._handle_talk_message = record
-        await instance._poll_room("dm-room")
-        self.assertEqual(calls, [(91, 10)])
-        self.assertEqual(seen, [(101, "dm-room")])
-
-    async def test_poll_ack_only_overlap_switches_to_live_long_poll_anchor(self):
-        calls = []
-        instance = self.make_adapter(lambda event: asyncio.sleep(0))
-        instance.max_poll_batch = 10
-        instance.poll_timeout = 30
-        instance.ack_overlap_ids = 9
-        instance.ack_retention_count = 32
-        instance._persist_cursors = lambda: None
-        for message_id in range(1, 101):
-            instance._commit_cursor("dm-room", message_id)
-
-        async def get_messages(*_args, **kwargs):
-            anchor = kwargs["last_known_id"]
-            calls.append((anchor, kwargs["timeout"], kwargs["limit"]))
-            if len(calls) == 1:
-                return [{"id": value} for value in range(92, 101)]
-            return []
+            seen.append(msg["id"])
 
         instance._client = types.SimpleNamespace(get_messages=get_messages)
+        instance._handle_talk_message = record
         await instance._poll_room("dm-room")
+        self.assertTrue(all(timeout == 0 for _anchor, timeout in calls[:-1]))
+        self.assertEqual(calls[-1], (100, 30))
+        self.assertEqual(seen, [101])
+        self.assertLessEqual(len(calls), 12)
 
-        self.assertEqual(calls, [(91, 30, 10), (100, 30, 10)])
-
-    async def test_poll_ack_only_overlap_live_response_dispatches_fresh_message(self):
-        seen = []
-        calls = []
-        instance = self.make_adapter(lambda event: asyncio.sleep(0))
-        instance.max_poll_batch = 10
-        instance.poll_timeout = 30
-        instance.ack_overlap_ids = 9
-        instance.ack_retention_count = 32
-        instance._persist_cursors = lambda: None
-        for message_id in range(1, 101):
-            instance._commit_cursor("dm-room", message_id)
+    async def test_prefix_floor_follows_observed_contiguous_history(self):
+        instance = self._prefix_room(range(1, 101))
+        self.assertEqual(instance._ack_rooms["dm-room"]["floor"], 0)
 
         async def get_messages(*_args, **kwargs):
-            calls.append(kwargs["last_known_id"])
-            if len(calls) == 1:
-                return [{"id": value} for value in range(92, 101)]
+            anchor = kwargs["last_known_id"] or 0
+            return [{"id": value} for value in range(anchor + 1, min(anchor + 10, 100) + 1)]
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        instance._handle_talk_message = lambda *_a, **_k: asyncio.sleep(0)
+        await instance._poll_room("dm-room")
+        state = instance._ack_rooms["dm-room"]
+        self.assertEqual(state["floor"], 100)
+        self.assertEqual(state["successful"], set())
+        self.assertEqual(instance._poll_anchor("dm-room"), 100)
+
+    async def test_unacknowledged_gap_stops_floor_and_stays_retryable(self):
+        instance = self._prefix_room([*range(1, 95), *range(96, 101)])
+        dispatched = []
+
+        async def get_messages(*_args, **kwargs):
+            anchor = kwargs["last_known_id"] or 0
+            return [{"id": value} for value in range(anchor + 1, min(anchor + 10, 100) + 1)]
+
+        async def record(msg, room):
+            dispatched.append(msg["id"])
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        instance._handle_talk_message = record
+        await instance._poll_room("dm-room")
+        await instance._poll_room("dm-room")
+        self.assertEqual(dispatched, [95, 95])
+        self.assertEqual(instance._ack_rooms["dm-room"]["floor"], 94)
+        self.assertFalse(instance._is_acknowledged("dm-room", 95))
+        instance._commit_cursor("dm-room", 95)
+        self.assertEqual(instance._ack_rooms["dm-room"]["floor"], 100)
+
+    async def test_floor_waits_out_settle_window_for_late_lower_ids(self):
+        instance = self._prefix_room([], settle=3600.0)
+        instance._observe_room_ids("dm-room", [10, 12])
+        instance._commit_cursor("dm-room", 10)
+        instance._commit_cursor("dm-room", 12)
+        # A lower ID that becomes visible later must still be dispatched.
+        self.assertEqual(instance._ack_rooms["dm-room"]["floor"], 0)
+        instance._observe_room_ids("dm-room", [11])
+        self.assertFalse(instance._is_acknowledged("dm-room", 11))
+
+    async def test_poll_live_response_dispatches_fresh_message(self):
+        instance = self._prefix_room(range(1, 101))
+        calls, seen = [], []
+
+        async def get_messages(*_args, **kwargs):
+            calls.append((kwargs["last_known_id"], kwargs["timeout"]))
+            if kwargs["timeout"] == 0:
+                return [{"id": value} for value in range((kwargs["last_known_id"] or 0) + 1, 101)][:9]
             return [{"id": 101}]
 
         async def record(msg, room):
-            seen.append((msg["id"], room))
+            seen.append(msg["id"])
 
         instance._client = types.SimpleNamespace(get_messages=get_messages)
         instance._handle_talk_message = record
         await instance._poll_room("dm-room")
-
-        self.assertEqual(calls, [91, 100])
-        self.assertEqual(seen, [(101, "dm-room")])
-
-    async def test_live_poll_anchor_is_not_persisted_past_omitted_retryable_gap(self):
-        seen = []
-        calls = []
-        instance = self.make_adapter(lambda event: asyncio.sleep(0))
-        instance.max_poll_batch = 10
-        instance.poll_timeout = 30
-        instance.ack_overlap_ids = 9
-        instance.ack_retention_count = 32
-        instance._persist_cursors = lambda: None
-        for message_id in [*range(1, 95), *range(96, 101)]:
-            instance._commit_cursor("dm-room", message_id)
-
-        responses = [
-            [{"id": value} for value in [92, 93, 94, 96, 97, 98, 99, 100]],
-            [],
-            [{"id": 95}],
-        ]
-
-        async def get_messages(*_args, **kwargs):
-            calls.append(kwargs["last_known_id"])
-            return responses.pop(0)
-
-        async def record(msg, room):
-            seen.append((msg["id"], room))
-
-        instance._client = types.SimpleNamespace(get_messages=get_messages)
-        instance._handle_talk_message = record
-        await instance._poll_room("dm-room")
-        await instance._poll_room("dm-room")
-
-        self.assertEqual(calls, [91, 100, 91])
-        self.assertEqual(seen, [(95, "dm-room")])
-        self.assertFalse(instance._is_acknowledged("dm-room", 95))
+        # Short pages do not end the sweep (Talk may hide messages after
+        # applying the limit); only an empty page does.
+        self.assertTrue(all(timeout == 0 for _anchor, timeout in calls[:-1]))
+        self.assertEqual(calls[-1], (100, 30))
+        self.assertEqual(seen, [101])
 
     async def test_malformed_message_parameters_does_not_block_newer_valid_message(self):
         seen = []
@@ -2114,7 +2105,10 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
                 with self.assertLogs(adapter.logger, level="WARNING") as logs:
                     await instance._poll_room("dm-room")
                 rendered = "\n".join(logs.output)
-                self.assertNotIn("dm-room", instance._last_message_ids)
+                # A retryable download error stays retryable (counted toward the
+                # bounded give-up) without blocking the next message.
+                self.assertFalse(instance._is_acknowledged("dm-room", 40))
+                self.assertEqual(instance._dispatch_attempts["dm-room"].get(40), 1)
                 self.assertNotIn("PRIVATE-BODY", rendered)
                 self.assertNotIn("PRIVATE-URL", rendered)
 
@@ -2378,7 +2372,7 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(stat.S_IMODE(instance._cursor_path.stat().st_mode), 0o600)
             self.assertEqual(
                 json.loads(instance._cursor_path.read_text()),
-                {"version": 2, "rooms": {"good": {
+                {"version": 2, "floor_mode": "prefix", "rooms": {"good": {
                     "floor": 42, "successful": [], "initialized": False,
                     "last_seen": 0, "active": False,
                 }}},
@@ -2487,7 +2481,7 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(instance._last_message_ids, {"room": 2})
             self.assertEqual(
                 json.loads(instance._cursor_path.read_text()),
-                {"version": 2, "rooms": {"room": {
+                {"version": 2, "floor_mode": "prefix", "rooms": {"room": {
                     "floor": 1, "successful": [2], "initialized": False,
                     "last_seen": 1, "active": False,
                 }}},
@@ -2496,7 +2490,7 @@ class SecurityHardeningRegressionTests(unittest.IsolatedAsyncioTestCase):
             self.assertEqual(len(artifacts), 1)
             self.assertEqual(
                 json.loads(artifacts[0].read_text()),
-                {"version": 2, "rooms": {"room": {
+                {"version": 2, "floor_mode": "prefix", "rooms": {"room": {
                     "floor": 1, "successful": [], "initialized": False,
                     "last_seen": 0, "active": False,
                 }}},

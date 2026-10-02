@@ -545,6 +545,156 @@ class CursorAndDeliveryTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(handled[0].media_urls, [__file__])
         self.assertEqual(handled[0].media_types, ["image/png"])
 
+    def _unavailable_file_msg(self, msg_id=23670):
+        # Shape Talk returns when the long-poll request could not resolve a
+        # share created after the request had set up the bot's filesystem.
+        return {"id": msg_id, "actorType": "users", "actorId": "alice", "actorDisplayName": "Alice",
+                "systemMessage": "", "messageType": "comment",
+                "message": "*{actor} shared a file which is no longer available*\n\ndescribe it",
+                "messageParameters": {"actor": {"type": "user", "id": "alice", "name": "Alice"}}}
+
+    def _resolved_file_msg(self, msg_id=23670):
+        return {"id": msg_id, "actorType": "users", "actorId": "alice", "actorDisplayName": "Alice",
+                "systemMessage": "", "messageType": "comment", "message": "describe it",
+                "messageParameters": {
+                    "actor": {"type": "user", "id": "alice", "name": "Alice"},
+                    "file": {"type": "file", "id": "33151", "name": "photo.jpg",
+                             "path": "Talk/photo.jpg", "link": "https://cloud.example/f/33151",
+                             "mimetype": "image/jpeg"}}}
+
+    async def test_unavailable_file_placeholder_is_refetched_and_media_reaches_handler(self):
+        handled, calls = [], []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+
+        async def get_messages(token, **kwargs):
+            calls.append((token, kwargs))
+            return [self._resolved_file_msg()]
+
+        instance._client = types.SimpleNamespace(
+            get_messages=get_messages,
+            _dav_url=lambda path: f"https://cloud.example/dav/{path}",
+            _download_file=lambda url, download_dir, **kwargs: __file__,
+        )
+        with patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_DELAYS", (0.0, 0.0), create=True):
+            await instance._handle_talk_message(self._unavailable_file_msg(), "dm-room")
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].media_urls, [__file__])
+        self.assertEqual(handled[0].media_types, ["image/jpeg"])
+        self.assertNotIn("no longer available", handled[0].text)
+        self.assertEqual(len(calls), 1)
+        token, kwargs = calls[0]
+        self.assertEqual(token, "dm-room")
+        self.assertFalse(kwargs["look_into_future"])
+        self.assertEqual(kwargs["last_known_id"], 23671)
+        self.assertEqual(kwargs["limit"], 1)
+
+    async def test_unavailable_file_refetch_retries_then_falls_back_to_text(self):
+        handled, calls = [], []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+
+        async def get_messages(token, **kwargs):
+            calls.append(kwargs)
+            if len(calls) == 1:
+                raise adapter.NextcloudTalkAPIError("HTTP 503", status_code=503)
+            return [self._unavailable_file_msg()]
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        with patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_DELAYS", (0.0, 0.0, 0.0), create=True):
+            await instance._handle_talk_message(self._unavailable_file_msg(), "dm-room")
+        self.assertEqual(len(calls), 3)
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].media_urls, [])
+        self.assertNotIn("{actor}", handled[0].text)
+        self.assertIn("Alice", handled[0].text)
+        self.assertEqual(instance._last_message_ids["dm-room"], 23670)
+
+    async def test_refetch_ignores_foreign_or_malformed_replacements(self):
+        handled = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+        foreign = self._resolved_file_msg(msg_id=23669)
+        spoofed = self._resolved_file_msg()
+        spoofed["actorId"] = "mallory"
+        broken = self._resolved_file_msg()
+        broken["messageParameters"]["file"]["path"] = 5
+        pages = [[foreign], [spoofed], [broken]]
+
+        async def get_messages(token, **kwargs):
+            return pages.pop(0)
+
+        instance._client = types.SimpleNamespace(
+            get_messages=get_messages,
+            _dav_url=lambda path: self.fail("must not download a rejected replacement"),
+        )
+        with patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_DELAYS", (0.0, 0.0, 0.0), create=True):
+            await instance._handle_talk_message(self._unavailable_file_msg(), "dm-room")
+        self.assertEqual(pages, [])
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].media_urls, [])
+
+    async def test_user_typed_placeholder_shape_does_not_refetch(self):
+        handled = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+
+        async def get_messages(*_a, **_k):
+            self.fail("ordinary messages must not trigger a refetch")
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        mention = {"mention-user1": {"type": "user", "id": "bob", "name": "Bob"}}
+        for msg_id, params in ((5, []), (6, mention)):
+            msg = {"id": msg_id, "actorType": "users", "actorId": "alice", "actorDisplayName": "Alice",
+                   "message": "*{actor} hi*", "messageParameters": params}
+            await instance._handle_talk_message(msg, "dm-room")
+        self.assertEqual([event.text for event in handled], ["*{actor} hi*", "*{actor} hi*"])
+
+    async def test_localized_placeholder_is_refetched(self):
+        handled, calls = [], []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+
+        async def get_messages(token, **kwargs):
+            calls.append(kwargs)
+            return [self._resolved_file_msg()]
+
+        instance._client = types.SimpleNamespace(
+            get_messages=get_messages,
+            _dav_url=lambda path: f"https://cloud.example/dav/{path}",
+            _download_file=lambda url, download_dir, **kwargs: __file__,
+        )
+        msg = self._unavailable_file_msg()
+        msg["message"] = "*{actor}\u306f\u5229\u7528\u3067\u304d\u306a\u3044\u30d5\u30a1\u30a4\u30eb\u3092\u5171\u6709\u3057\u307e\u3057\u305f*\n\ncaption"
+        with patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_DELAYS", (0.0,), create=True):
+            await instance._handle_talk_message(msg, "dm-room")
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(handled[0].media_types, ["image/jpeg"])
+
+    async def test_hung_refetch_is_bounded_and_falls_back(self):
+        handled = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+
+        async def get_messages(*_a, **_k):
+            await asyncio.sleep(3600)
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        with patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_DELAYS", (0.0, 0.0), create=True), \
+                patch.object(adapter, "_UNAVAILABLE_FILE_REFETCH_TIMEOUT", 0.05, create=True):
+            await asyncio.wait_for(
+                instance._handle_talk_message(self._unavailable_file_msg(), "dm-room"), 5
+            )
+        self.assertEqual(len(handled), 1)
+        self.assertEqual(handled[0].media_urls, [])
+
+    async def test_unauthorized_unavailable_file_does_not_refetch(self):
+        handled = []
+        instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))
+        instance.allow_all = False
+        instance.allowed_users = {"bob"}
+
+        async def get_messages(*_a, **_k):
+            self.fail("unauthorized senders must not trigger network work")
+
+        instance._client = types.SimpleNamespace(get_messages=get_messages)
+        await instance._handle_talk_message(self._unavailable_file_msg(), "dm-room")
+        self.assertEqual(handled, [])
+
     async def test_oversized_attachment_is_quarantined_and_cursor_commits(self):
         handled = []
         instance = self.make_adapter(lambda event: asyncio.sleep(0, result=handled.append(event)))

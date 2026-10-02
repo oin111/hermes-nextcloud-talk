@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.13] - 2026-10-02 (UTC)
+
+### Fixed
+
+- Images and files sent while the bot was waiting in a long poll reached Hermes as
+  Talk's "{actor} shared a file which is no longer available" stand-in without the
+  attachment. Talk resolves the share inside the long-poll request whose filesystem
+  view predates the new share, fails, and drops the `file` parameter. The adapter now
+  recognises that stand-in (an emphasized first line containing `{actor}`, an `actor`
+  parameter and no `file` parameter, in any server language) and re-reads the same
+  message with a short ordinary history request (1 s, 2 s, 4 s backoff, each attempt
+  capped at 10 s so a hung server cannot stall the other rooms for long). A replacement is accepted only when it has the same
+  message ID, the same actor and valid file metadata; then the attachment is downloaded
+  as usual. If every attempt fails, the message is delivered as text with the actor name
+  filled in. The refetch runs only after authorization checks.
+
 ## [0.1.12] - 2026-09-30 (UTC)
 
 ### Changed

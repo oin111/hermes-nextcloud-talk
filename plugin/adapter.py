@@ -152,7 +152,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.12"
+_RELEASED_VERSION = "0.1.13"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -232,6 +232,13 @@ _MAX_METADATA_DEPTH = 8
 _MAX_METADATA_NODES = 512
 _MAX_ROOM_TOKEN_LENGTH = 128
 _MAX_TALK_MESSAGE_ID = (1 << 63) - 1
+# Talk renders a file share whose node cannot be resolved inside the current
+# request as "*{actor} shared a file which is no longer available*" and drops
+# the ``file`` parameter.  A long-poll request that set up the bot's filesystem
+# before the share existed hits this for every fresh upload, so the message is
+# re-read with short ordinary history requests before falling back to text.
+_UNAVAILABLE_FILE_REFETCH_DELAYS = (1.0, 2.0, 4.0)
+_UNAVAILABLE_FILE_REFETCH_TIMEOUT = 10.0
 _MIN_CONVERSATION_TYPE = 1
 _MAX_CONVERSATION_TYPE = 6
 _ATTACHMENT_CACHE_MANIFEST_VERSION = 1
@@ -299,6 +306,52 @@ def _valid_message_parameters(parameters: Any) -> bool:
         elif value is not None and not isinstance(value, (bool, int, float)):
             return False
     return True
+
+
+def _is_unavailable_file_placeholder(text: str, parameters: Dict[str, Any]) -> bool:
+    """Detect Talk's server-rendered stand-in for an unresolved file share.
+
+    The rendered sentence is localized, so match its structure instead: it is
+    an emphasized first line containing the ``{actor}`` placeholder, and the parameters
+    carry the system ``actor`` entry but no ``file`` entry.  Ordinary user
+    comments have no ``actor`` parameter, so typed text cannot trigger this.
+    """
+    actor = parameters.get("actor")
+    if not isinstance(actor, dict) or actor.get("type") != "user":
+        return False
+    if any(isinstance(p, dict) and p.get("type") == "file" for p in parameters.values()):
+        return False
+    # The caption, if any, follows a blank line; translations place {actor}
+    # anywhere in the sentence (ja "*{actor}は...", el "*Ο/Η {actor} ...").
+    first = text.split("\n\n", 1)[0].strip()
+    return len(first) > 2 and first.startswith("*") and first.endswith("*") and "{actor}" in first
+
+
+def _validated_file_share_replacement(
+    candidate: Any, numeric_id: int, actor_id: str, actor_type: str
+) -> Optional[tuple]:
+    if not isinstance(candidate, dict):
+        return None
+    if _strict_talk_message_id(candidate.get("id")) != numeric_id:
+        return None
+    if candidate.get("actorId") != actor_id or str(candidate.get("actorType") or "") != actor_type:
+        return None
+    if candidate.get("systemMessage"):
+        return None
+    parameters = candidate.get("messageParameters")
+    if not _valid_message_parameters(parameters):
+        return None
+    files = [p for p in parameters.values() if p.get("type") == "file"]
+    if not files:
+        return None
+    for param in files:
+        if any(not isinstance(param.get(field, ""), str)
+               for field in ("name", "path", "link", "mimetype")):
+            return None
+    text = candidate.get("message")
+    if not isinstance(text, str):
+        return None
+    return candidate, text.strip(), dict(parameters)
 
 
 def _truthy(value: Any, default: bool = False) -> bool:
@@ -3281,6 +3334,58 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return
         self._finish_without_ack(event, room_token, numeric_id, generation)
 
+    async def _refetch_unavailable_file(
+        self, room_token: str, numeric_id: int,
+        actor_id: str, actor_type: str,
+    ) -> Optional[tuple]:
+        """Re-read a file-share message whose file Talk failed to resolve.
+
+        Returns ``(msg, text, file_refs)`` from a fresh request that carries a
+        valid ``file`` parameter, or ``None`` when every attempt failed.  The
+        replacement must be the same message from the same actor.
+        """
+        client = self._client
+        fetch = getattr(client, "get_messages", None) if client is not None else None
+        if fetch is None or numeric_id >= _MAX_TALK_MESSAGE_ID:
+            return None
+        for delay in _UNAVAILABLE_FILE_REFETCH_DELAYS:
+            if delay > 0:
+                await asyncio.sleep(delay)
+            try:
+                # Bound each attempt: the poll loop gathers every room, so a
+                # hung server must not stall the other rooms for long.
+                page = await asyncio.wait_for(
+                    fetch(
+                        room_token,
+                        last_known_id=numeric_id + 1,
+                        look_into_future=False,
+                        timeout=0,
+                        limit=1,
+                    ),
+                    _UNAVAILABLE_FILE_REFETCH_TIMEOUT,
+                )
+            except (NextcloudTalkAPIError, OSError, asyncio.TimeoutError) as exc:
+                logger.debug(
+                    "[nextcloud_talk] Refetch of message %s failed: %s",
+                    numeric_id, _error_class_name(exc),
+                )
+                continue
+            for candidate in page if isinstance(page, list) else ():
+                parsed = _validated_file_share_replacement(
+                    candidate, numeric_id, actor_id, actor_type
+                )
+                if parsed is not None:
+                    logger.info(
+                        "[nextcloud_talk] Resolved unavailable file share in message %s on refetch",
+                        numeric_id,
+                    )
+                    return parsed
+        logger.warning(
+            "[nextcloud_talk] File share in message %s in room %s stayed unavailable after refetch",
+            numeric_id, self._safe_room_token(room_token),
+        )
+        return None
+
     async def _handle_talk_message(
         self, msg: Dict[str, Any], room_token: str, *, await_completion: bool = False
     ) -> None:
@@ -3404,6 +3509,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         ):
             return
         await_completion = await_completion or bool(inflight)
+
+        if _is_unavailable_file_placeholder(text, file_refs):
+            replacement = await self._refetch_unavailable_file(
+                room_token, numeric_id, actor_id, actor_type
+            )
+            if replacement is not None:
+                msg, text, file_refs = replacement
+            else:
+                text = text.replace("{actor}", actor_name or actor_id)
 
         # Resolve file attachments from messageParameters.  Talk captions do
         # not necessarily contain a ``{file}`` placeholder, so carry every

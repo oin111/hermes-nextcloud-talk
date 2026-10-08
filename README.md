@@ -9,6 +9,8 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Native `nextcloud_talk` platform inside Hermes Gateway.
 - Standard Hermes sessions, memory, tools, approvals, slash commands, and reply routing.
 - Concurrent polling of multiple Talk rooms with independent message cursors.
+- Talk threads become Hermes topics: each thread has its own session, and replies go back into the thread.
+- Optional operator-defined topics: the bot creates named threads at startup, each with its own skill(s) and prompt.
 - Exact-session routing for typed `clarify` answers while a Hermes turn is blocked waiting for user input.
 - Automatic discovery of new one-to-one conversations.
 - Explicit group/public room configuration.
@@ -252,6 +254,49 @@ version or otherwise has an envelope shape is preserved byte-for-byte, persisten
 blocked, and no envelope field is reinterpreted as a room. Recover such a file only
 after upgrading to a compatible plugin or explicitly moving it aside.
 
+### Threads and topics
+
+Talk threads (Talk 22+, `threads` capability) map to Hermes topics, like Telegram forum
+topics:
+
+- A message inside a thread (Talk marks it `isThread: true`) gets the thread ID as the Hermes
+  `thread_id`, so every thread has its own session, history and context. The thread title is
+  passed as the chat topic. Ordinary messages stay in the room session.
+- By default everyone in a thread shares one session (`thread_sessions_per_user: false`).
+- Replies, captions, and files the bot sends for a thread message are posted into the same
+  thread. If Talk rejects the thread (HTTP 400, e.g. after the chat history was cleared) the reply goes to the
+  main chat, without the quote, instead of being lost.
+- Talk sets every thread message's parent to the thread root. That implicit parent is not
+  passed to Hermes as a quoted reply; an explicit reply to another message in the thread is.
+
+Optional topics the bot creates and keeps (YAML only, in this profile's `config.yaml`):
+
+```yaml
+gateway:
+  platforms:
+    nextcloud_talk:
+      extra:
+        thread_topics:
+          - room: abc123xy          # a room this bot polls
+            title: Research         # thread title (unique per room, case-insensitive)
+            skill: arxiv            # or skills: [arxiv, ocr-and-documents]
+            prompt: Answer briefly, cite sources.   # optional ephemeral prompt
+            message: Research topic  # optional first message (default: the title)
+```
+
+At startup the adapter checks the `threads` capability, then for each topic reuses the
+thread it created before (IDs are kept in `cache/nextcloud_talk/thread_topics.json`), adopts
+an existing thread with the same title only if the bot itself started it (among the room's 50
+most recent threads, Talk's page limit), or creates a new one. A deleted thread is recreated
+on the next start once the room's thread list confirms the room is still reachable; a lookup
+that fails for any other reason never creates a duplicate. Messages in a topic thread load the topic's skill(s) and prompt;
+renaming the thread in Talk keeps the binding. At most 50 topics are read.
+
+Limitations: one room is still processed one message at a time, so a long turn in one thread
+delays the room's other threads until it finishes (other rooms are unaffected). Talk does not
+support threads in federated rooms. Proactive sends without thread metadata (cron delivery,
+`send_message`) go to the main chat.
+
 ### Multiple profiles under one gateway (multiplex)
 
 With `gateway.multiplex_profiles: true` a single Hermes gateway process serves several
@@ -383,7 +428,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.13 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.14 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

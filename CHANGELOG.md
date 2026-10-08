@@ -2,6 +2,31 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.14] - 2026-10-08 (UTC)
+
+### Added
+
+- Talk threads map to Hermes topics. A message Talk marks with `isThread: true` carries the
+  thread ID as the Hermes `thread_id` (own session per thread) and the sanitized thread title
+  as the chat topic. Messages without that exact marker stay in the room session, because
+  Talk gives every message a `threadId`.
+- Outbound `thread_id` metadata becomes Talk `threadId` for text, split chunks, file shares
+  (`talkMetaData.threadId`), non-atomic captions and link follow-ups. A definite HTTP 400
+  for the thread falls back to the main chat once, without the reply anchor (it points into the
+  rejected thread); an ambiguous send is still never repeated. A file the server could not tag
+  with the thread is logged as shared to the main chat.
+- `thread_topics` (YAML): bot-created topic threads with their own skill(s) and prompt. The
+  adapter reuses its persisted thread IDs, adopts only threads the bot itself started, never
+  creates a duplicate on an inconclusive lookup, and skips rooms it does not poll or servers
+  without the `threads` capability. Setup runs in the background with a time limit; each
+  binding is saved as soon as it is made, and a lost thread is forgotten only after the room's
+  thread list has been read (a missing room or lost access keeps the binding).
+
+### Changed
+
+- Inside a thread, Talk's implicit parent (the thread root) is no longer passed to Hermes as a
+  quoted reply.
+
 ## [0.1.13] - 2026-10-02 (UTC)
 
 ### Fixed

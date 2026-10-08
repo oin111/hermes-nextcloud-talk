@@ -152,7 +152,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.13"
+_RELEASED_VERSION = "0.1.14"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -232,6 +232,12 @@ _MAX_METADATA_DEPTH = 8
 _MAX_METADATA_NODES = 512
 _MAX_ROOM_TOKEN_LENGTH = 128
 _MAX_TALK_MESSAGE_ID = (1 << 63) - 1
+_MAX_THREAD_TITLE_LENGTH = 200
+_MAX_THREAD_TOPICS = 50
+_MAX_TOPIC_PROMPT_LENGTH = 4000
+_MAX_TOPIC_SKILLS = 16
+_THREAD_TOPICS_TIMEOUT = 120.0
+_THREAD_TOPICS_LOOKUP_LIMIT = 50  # Talk rejects a larger page with HTTP 400
 # Talk renders a file share whose node cannot be resolved inside the current
 # request as "*{actor} shared a file which is no longer available*" and drops
 # the ``file`` parameter.  A long-poll request that set up the bot's filesystem
@@ -270,6 +276,106 @@ def _strict_talk_message_id(value: Any) -> Optional[int]:
     if type(value) is int and 0 < value <= _MAX_TALK_MESSAGE_ID:
         return value
     return None
+
+
+def _inbound_thread_id(msg: Dict[str, Any], numeric_id: int) -> Optional[int]:
+    """Return the Talk thread of a message only when Talk marks it a real thread.
+
+    Every Talk message carries ``threadId`` (its own ID when it is not in a
+    thread), so only an exact ``isThread: true`` makes it a topic.  The root
+    of a thread is never newer than a message inside it.
+    """
+    if msg.get("isThread") is not True:
+        return None
+    thread_id = _strict_talk_message_id(msg.get("threadId"))
+    if thread_id is None or thread_id > numeric_id:
+        return None
+    return thread_id
+
+
+def _outbound_thread_id(metadata: Any) -> Optional[int]:
+    """Map Hermes ``metadata["thread_id"]`` to a validated Talk ``threadId``."""
+    if not isinstance(metadata, dict):
+        return None
+    raw = metadata.get("thread_id")
+    if type(raw) is int:
+        return _strict_talk_message_id(raw)
+    if isinstance(raw, str) and 0 < len(raw) <= 19 and raw.isascii() and raw.isdigit():
+        return _strict_talk_message_id(int(raw))
+    return None
+
+
+def _thread_title(value: Any) -> Optional[str]:
+    if not isinstance(value, str):
+        return None
+    title = _sanitize_reply_field(" ".join(value[: _MAX_THREAD_TITLE_LENGTH * 4].split()), _MAX_THREAD_TITLE_LENGTH)
+    return title[:_MAX_THREAD_TITLE_LENGTH] or None
+
+
+def _parse_thread_topics(raw: Any) -> List[Dict[str, Any]]:
+    """Validate ``extra.thread_topics``; invalid entries are dropped with a warning."""
+    if raw in (None, "", []):
+        return []
+    if not isinstance(raw, list):
+        logger.warning("[nextcloud_talk] thread_topics must be a list; ignoring it")
+        return []
+    topics: List[Dict[str, Any]] = []
+    seen: Set[tuple[str, str]] = set()
+    for index, entry in enumerate(raw):
+        if len(topics) >= _MAX_THREAD_TOPICS:
+            logger.warning(
+                "[nextcloud_talk] thread_topics has more than %d entries; ignoring the rest",
+                _MAX_THREAD_TOPICS,
+            )
+            break
+        if not isinstance(entry, dict):
+            logger.warning("[nextcloud_talk] thread_topics[%d] is not a mapping; ignored", index)
+            continue
+        room = entry.get("room")
+        title = _thread_title(entry.get("title") or entry.get("name"))
+        if (
+            not isinstance(room, str)
+            or not re.fullmatch(rf"[A-Za-z0-9]{{1,{_MAX_ROOM_TOKEN_LENGTH}}}", room)
+            or not title
+        ):
+            logger.warning(
+                "[nextcloud_talk] thread_topics[%d] needs a room token and a title; ignored",
+                index,
+            )
+            continue
+        if (room, title.casefold()) in seen:
+            logger.warning("[nextcloud_talk] thread_topics[%d] duplicates a title; ignored", index)
+            continue
+        raw_skills = entry.get("skills", entry.get("skill"))
+        if isinstance(raw_skills, str):
+            raw_skills = [raw_skills]
+        skills: List[str] = []
+        if isinstance(raw_skills, list):
+            for name in raw_skills[:_MAX_TOPIC_SKILLS]:
+                if isinstance(name, str) and re.fullmatch(r"[A-Za-z0-9_.:/-]{1,128}", name.strip()):
+                    if name.strip() not in skills:
+                        skills.append(name.strip())
+        prompt = entry.get("prompt")
+        prompt = (
+            _sanitize_prompt_text(prompt)[:_MAX_TOPIC_PROMPT_LENGTH].strip() or None
+            if isinstance(prompt, str) else None
+        )
+        message = entry.get("message")
+        message = message.strip()[:2000] if isinstance(message, str) and message.strip() else title
+        seen.add((room, title.casefold()))
+        topics.append({
+            "room": room, "title": title, "skills": skills or None,
+            "prompt": prompt, "message": message,
+        })
+    return topics
+
+
+def _sanitize_prompt_text(value: str) -> str:
+    """Keep newlines/tabs in an operator prompt; drop other control code points."""
+    return "".join(
+        character for character in value
+        if character in "\n\t" or unicodedata.category(character) not in {"Cc", "Cf", "Cs"}
+    )
 
 
 def _valid_message_parameters(parameters: Any) -> bool:
@@ -909,15 +1015,53 @@ class NextcloudTalkClient:
         return [room["token"] for room in await self.list_conversations() if room["type"] == 1]
 
     async def send_message(self, room_token: str, message: str, *, reply_to: Optional[str] = None,
-                           reference_id: Optional[str] = None) -> Any:
+                           reference_id: Optional[str] = None,
+                           thread_id: Optional[int] = None,
+                           thread_title: Optional[str] = None) -> Any:
         data = {"message": message}
         if reference_id:
             data["referenceId"] = reference_id
         if reply_to:
             data["replyTo"] = reply_to
+        if thread_id is not None:
+            data["threadId"] = str(int(thread_id))
+        elif thread_title:
+            # Talk creates a new thread rooted at this message.
+            data["threadTitle"] = thread_title
         return await asyncio.to_thread(
             self._request, "POST", room_token, data=data, expected_types=(dict,)
         )
+
+    def _thread_url(self, room_token: str, suffix: str) -> str:
+        return self._url(room_token) + suffix
+
+    def _get_thread_sync(self, room_token: str, thread_id: int) -> Any:
+        endpoint = self._thread_url(room_token, f"/threads/{int(thread_id)}")[len(self.base_url):]
+        return self._ocs_get(endpoint, expected_types=(dict,))
+
+    async def get_thread(self, room_token: str, thread_id: int) -> Optional[dict]:
+        """Return one thread, or ``None`` when Talk reports it does not exist."""
+        try:
+            return await asyncio.to_thread(self._get_thread_sync, room_token, thread_id)
+        except NextcloudTalkAPIError as exc:
+            if exc.status_code == 404:
+                return None
+            raise
+
+    async def list_recent_threads(self, room_token: str, limit: int) -> List[dict]:
+        endpoint = self._thread_url(room_token, "/threads/recent")[len(self.base_url):]
+        data = await asyncio.to_thread(
+            self._ocs_get, endpoint, {"limit": int(limit)}, expected_types=(list,)
+        )
+        return [item for item in data if isinstance(item, dict)]
+
+    async def supports_threads(self) -> bool:
+        data = await asyncio.to_thread(
+            self._ocs_get, "/ocs/v2.php/cloud/capabilities", expected_types=(dict,)
+        )
+        spreed = (data.get("capabilities") or {}).get("spreed") if isinstance(data, dict) else None
+        features = spreed.get("features") if isinstance(spreed, dict) else None
+        return isinstance(features, list) and "threads" in features
 
     def _dav_url(self, remote_path: str) -> str:
         if not isinstance(remote_path, str) or not remote_path or len(remote_path) > _MAX_DAV_PATH_LENGTH:
@@ -1482,15 +1626,18 @@ class NextcloudTalkClient:
 
     def _share_file_to_talk_sync(self, remote_path: str, room_token: str, *,
                                  caption: Optional[str] = None,
-                                 reply_to: Optional[str] = None) -> Any:
+                                 reply_to: Optional[str] = None,
+                                 thread_id: Optional[int] = None) -> Any:
         form: Dict[str, Any] = {
             "path": remote_path, "shareType": 10, "shareWith": room_token
         }
-        talk_metadata: Dict[str, str] = {}
+        talk_metadata: Dict[str, Any] = {}
         if caption:
             talk_metadata["caption"] = _sanitize_reply_field(caption, 2000)
         if reply_to:
             talk_metadata["replyTo"] = _sanitize_reply_field(reply_to, 64)
+        if thread_id is not None:
+            talk_metadata["threadId"] = int(thread_id)
         if talk_metadata:
             form["talkMetaData"] = json.dumps(
                 talk_metadata, sort_keys=True, separators=(",", ":")
@@ -1507,13 +1654,15 @@ class NextcloudTalkClient:
 
     async def upload_and_share_file(self, local_path: str, room_token: str,
                                     upload_folder: str, *, caption: Optional[str] = None,
-                                    reply_to: Optional[str] = None) -> tuple[str, Any, bool, bool]:
+                                    reply_to: Optional[str] = None,
+                                    thread_id: Optional[int] = None) -> tuple[str, Any, bool, bool]:
         remote_path = await asyncio.to_thread(self._upload_file_sync, local_path, upload_folder)
         try:
-            if caption or reply_to:
+            if caption or reply_to or thread_id is not None:
                 share = await asyncio.to_thread(
                     self._share_file_to_talk_sync, remote_path, room_token,
                     caption=caption, reply_to=reply_to,
+                    **({"thread_id": thread_id} if thread_id is not None else {}),
                 )
             else:
                 share = await asyncio.to_thread(
@@ -1521,7 +1670,7 @@ class NextcloudTalkClient:
                 )
             return remote_path, share, True, True
         except NextcloudTalkAPIError as exc:
-            if (caption or reply_to) and exc.category == "capability":
+            if (caption or reply_to or thread_id is not None) and exc.category == "capability":
                 # A structured capability response is the only safe proof that
                 # this server cannot attach Talk metadata atomically.
                 share = await asyncio.to_thread(
@@ -1710,6 +1859,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             _DEFAULT_FLOOR_SETTLE_SECONDS,
         )))
         self._cursor_path = get_hermes_home() / "cache" / "nextcloud_talk" / "cursors.json"
+        self._topics_path = get_hermes_home() / "cache" / "nextcloud_talk" / "thread_topics.json"
+        self.thread_topics = _parse_thread_topics(extra.get("thread_topics"))
+        self._topic_threads: Dict[tuple[str, str], int] = {}
+        self._topics_task: Optional[asyncio.Task] = None
         self._last_discovery_at = 0.0
         self._running = False
         self._cursor_lock = threading.RLock()
@@ -1936,6 +2089,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             await self._refresh_discovered_rooms(force=True, process_new_messages=False)
             self._running = True
             self._poll_task = asyncio.create_task(self._poll_loop())
+            if self.thread_topics:
+                previous_topics_task = getattr(self, "_topics_task", None)
+                if previous_topics_task is not None and not previous_topics_task.done():
+                    # A repeated connect() must not leave an orphaned setup task.
+                    previous_topics_task.cancel()
+                    await asyncio.gather(previous_topics_task, return_exceptions=True)
+                self._load_topic_threads()
+                self._topics_task = asyncio.create_task(self._ensure_thread_topics_bounded())
             rooms_safe = ", ".join(self._safe_room_token(t) for t in self.room_tokens)
             logger.info("[nextcloud_talk] Connected to rooms: %s", rooms_safe)
             self._mark_connected()
@@ -1955,6 +2116,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             except asyncio.CancelledError:
                 pass
         self._poll_task = None
+        topics_task = getattr(self, "_topics_task", None)
+        if topics_task is not None and not topics_task.done():
+            topics_task.cancel()
+            await asyncio.gather(topics_task, return_exceptions=True)
+        self._topics_task = None
         initialization_tasks = list(getattr(self, "_initialization_tasks", {}).values())
         for task in initialization_tasks:
             task.cancel()
@@ -1996,6 +2162,159 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._initializing_rooms.clear()
         self._mark_disconnected()
         logger.info("[nextcloud_talk] Disconnected")
+
+    def _topics_identity(self) -> str:
+        return f"{str(self.base_url).rstrip('/')}|{str(self.username).lower()}"
+
+    def _load_topic_threads(self) -> None:
+        """Load bot-created topic thread IDs persisted by an earlier start."""
+        self._topic_threads = {}
+        path = getattr(self, "_topics_path", None)
+        try:
+            if path is None or not path.is_file() or path.stat().st_size > 256 * 1024:
+                return
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            _log_cursor_cache_warning("load thread topics", exc)
+            return
+        if not isinstance(data, dict) or data.get("identity") != self._topics_identity():
+            return
+        rooms = data.get("rooms")
+        if not isinstance(rooms, dict):
+            return
+        wanted = {(topic["room"], topic["title"].casefold()) for topic in self.thread_topics}
+        for room, titles in rooms.items():
+            if not isinstance(titles, dict):
+                continue
+            for title, thread_id in titles.items():
+                key = (room, title) if isinstance(title, str) else None
+                if key in wanted and _strict_talk_message_id(thread_id) is not None:
+                    self._topic_threads[key] = thread_id
+
+    def _persist_topic_threads(self) -> None:
+        path = getattr(self, "_topics_path", None)
+        if path is None:
+            return
+        rooms: Dict[str, Dict[str, int]] = {}
+        for (room, title), thread_id in sorted(self._topic_threads.items()):
+            rooms.setdefault(room, {})[title] = thread_id
+        payload = {"version": 1, "identity": self._topics_identity(), "rooms": rooms}
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            tmp.write_text(json.dumps(payload, sort_keys=True), encoding="utf-8")
+            os.replace(tmp, path)
+        except OSError as exc:
+            _log_cursor_cache_warning("persist thread topics", exc)
+
+    def _topic_for_thread(self, room_token: str, thread_id: Optional[int]) -> Optional[Dict[str, Any]]:
+        if thread_id is None:
+            return None
+        for topic in getattr(self, "thread_topics", None) or []:
+            if topic["room"] != room_token:
+                continue
+            known = getattr(self, "_topic_threads", None) or {}
+            if known.get((room_token, topic["title"].casefold())) == thread_id:
+                return topic
+        return None
+
+    async def _ensure_thread_topics_bounded(self) -> None:
+        try:
+            await asyncio.wait_for(self._ensure_thread_topics(), timeout=_THREAD_TOPICS_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.warning(
+                "[nextcloud_talk] Could not prepare thread topics: %s",
+                _safe_outward_error_text(exc),
+            )
+
+    async def _ensure_thread_topics(self) -> None:
+        """Find or create one bot-owned Talk thread per configured topic."""
+        if not self.thread_topics or self._client is None:
+            return
+        if not await self._client.supports_threads():
+            logger.warning(
+                "[nextcloud_talk] thread_topics configured, but this Talk server has no "
+                "threads capability; topics were not created"
+            )
+            return
+        polled = set(self.room_tokens)
+        recent_by_room: Dict[str, List[dict]] = {}
+        for topic in self.thread_topics:
+            room, title = topic["room"], topic["title"]
+            key = (room, title.casefold())
+            if room not in polled:
+                logger.warning(
+                    "[nextcloud_talk] Topic %r skipped: room %s is not polled by this bot",
+                    _safe_log_text(title, 80), self._safe_room_token(room),
+                )
+                continue
+            try:
+                known = self._topic_threads.get(key)
+                if known is not None and await self._client.get_thread(room, known) is not None:
+                    continue
+                # Talk answers 404 for a deleted thread, but also when the room
+                # itself is gone or the bot lost access.  Only a successful
+                # thread listing for the room proves the room is reachable, so
+                # the binding is dropped after that call, never before it.
+                if room not in recent_by_room:
+                    recent_by_room[room] = await self._client.list_recent_threads(
+                        room, _THREAD_TOPICS_LOOKUP_LIMIT
+                    )
+                if known is not None:
+                    self._topic_threads.pop(key, None)
+                    self._persist_topic_threads()
+                adopted = self._find_own_thread(recent_by_room[room], title)
+                if adopted is None:
+                    result = await self._client.send_message(
+                        room, topic["message"], reference_id=str(uuid.uuid4()),
+                        thread_title=title,
+                    )
+                    adopted = _strict_talk_message_id(
+                        result.get("id") if isinstance(result, dict) else None
+                    )
+                    if adopted is None:
+                        raise NextcloudTalkAPIError(
+                            "Talk thread creation returned an invalid message ID",
+                            category="protocol",
+                        )
+                    logger.info(
+                        "[nextcloud_talk] Created topic %r in room %s",
+                        _safe_log_text(title, 80), self._safe_room_token(room),
+                    )
+                self._topic_threads[key] = adopted
+                # Persist each binding at once: a time-out or cancellation
+                # later in the loop must not forget a thread already created.
+                self._persist_topic_threads()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.warning(
+                    "[nextcloud_talk] Topic %r in room %s not prepared: %s",
+                    _safe_log_text(title, 80), self._safe_room_token(room),
+                    _safe_outward_error_text(exc),
+                )
+
+    def _find_own_thread(self, threads: List[dict], title: str) -> Optional[int]:
+        """Adopt an existing thread only if this bot created it with the same title."""
+        own = str(self.username).lower()
+        for item in threads:
+            thread = item.get("thread") if isinstance(item, dict) else None
+            first = item.get("first") if isinstance(item, dict) else None
+            if not isinstance(thread, dict) or not isinstance(first, dict):
+                continue
+            thread_id = _strict_talk_message_id(thread.get("id"))
+            if (
+                thread_id is not None
+                and (_thread_title(thread.get("title")) or "").casefold() == title.casefold()
+                and first.get("actorType") == "users"
+                and isinstance(first.get("actorId"), str)
+                and first["actorId"].lower() == own
+                and first.get("id") == thread_id
+            ):
+                return thread_id
+        return None
 
     def _load_cursors(self) -> None:
         self._ensure_ack_runtime()
@@ -3494,12 +3813,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._commit_cursor(room_token, numeric_id)
             return
 
+        thread_id = _inbound_thread_id(msg, numeric_id)
+        thread_fields: Dict[str, Any] = {}
+        if thread_id is not None:
+            thread_fields["thread_id"] = str(thread_id)
+            thread_title = _thread_title(msg.get("threadTitle"))
+            if thread_title:
+                thread_fields["chat_topic"] = thread_title
         source = self.build_source(
             chat_id=room_token,
             chat_name=f"Nextcloud Talk {self._safe_room_token(room_token)}",
             chat_type=chat_type,
             user_id=actor_id or actor_name,
             user_name=actor_name,
+            **thread_fields,
         )
         # Apply the exact-session room-lock exception before attachment I/O.
         # A message that cannot answer the unresolved clarify must remain on
@@ -3625,6 +3952,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
         parent = msg.get("parent")
         reply_fields: Dict[str, Any] = {}
+        if isinstance(parent, dict) and thread_id is not None and parent.get("id") == thread_id:
+            # Talk sets every thread message's parent to the thread root; that
+            # root is the topic itself, not a quote the user chose.
+            parent = None
         if isinstance(parent, dict):
             parent_id = parent.get("id")
             parent_text = parent.get("message")
@@ -3665,9 +3996,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 "nextcloud_talk_message_id": numeric_id,
                 "nextcloud_talk_generation": generation,
                 "nextcloud_talk_completion_event": completion_event,
+                **({"nextcloud_talk_thread_id": thread_id} if thread_id is not None else {}),
             },
             **reply_fields,
         )
+        topic = self._topic_for_thread(room_token, thread_id)
+        if topic is not None:
+            if topic.get("skills") and hasattr(event, "auto_skill"):
+                event.auto_skill = list(topic["skills"])
+            if topic.get("prompt") and hasattr(event, "channel_prompt"):
+                event.channel_prompt = topic["prompt"]
         if generation_key is not None:
             self._inflight_message_ids.setdefault(room_token, set()).add(numeric_id)
             self._inflight_generations[generation_key] = event
@@ -3815,12 +4153,38 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return SendResult(success=False, error="No room token configured")
         chunks = self._split_message(_strip_rich_text(content))
         message_ids: List[str] = []
+        thread_id = _outbound_thread_id(metadata)
         try:
             for chunk in chunks:
                 reference_id = str(uuid.uuid4())
-                result = await self._client.send_message(
-                    target_room, chunk, reply_to=reply_to, reference_id=reference_id
-                )
+                if thread_id is None:
+                    result = await self._client.send_message(
+                        target_room, chunk, reply_to=reply_to, reference_id=reference_id
+                    )
+                else:
+                    try:
+                        result = await self._client.send_message(
+                            target_room, chunk, reply_to=reply_to,
+                            reference_id=reference_id, thread_id=thread_id,
+                        )
+                    except NextcloudTalkAPIError as exc:
+                        if exc.status_code != 400:
+                            raise
+                        # A definite 400 means nothing was posted: the thread is
+                        # gone (deleted, or unknown to an older Talk). Deliver to
+                        # the main chat instead of losing the reply.  The reply
+                        # anchor is dropped too: inside a thread it points at a
+                        # message of that same thread, which Talk would reject
+                        # again (or re-route into the dead thread).
+                        logger.warning(
+                            "[nextcloud_talk] Thread %s rejected in room %s; sending to main chat",
+                            thread_id, self._safe_room_token(target_room),
+                        )
+                        thread_id = None
+                        reply_to = None
+                        result = await self._client.send_message(
+                            target_room, chunk, reference_id=str(uuid.uuid4()),
+                        )
                 talk_id = _strict_talk_message_id(
                     result.get("id") if isinstance(result, dict) else None
                 )
@@ -3897,10 +4261,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         *,
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
+        thread_kwargs = (
+            {"metadata": metadata} if _outbound_thread_id(metadata) is not None else {}
+        )
         try:
             result = await self._send_file_attachment(
-                chat_id, local_path, caption=caption, reply_to=reply_to
+                chat_id, local_path, caption=caption, reply_to=reply_to, **thread_kwargs
             )
         except BaseException:
             self._record_media_delivery_result(None)
@@ -3909,7 +4277,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         return result
 
     async def _send_file_attachment(self, chat_id: str, local_path: str, caption: Optional[str] = None,
-                                    reply_to: Optional[str] = None) -> SendResult:
+                                    reply_to: Optional[str] = None,
+                                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="Not connected")
         path = Path(str(local_path)).expanduser()
@@ -3928,9 +4297,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         remote_path: Optional[str] = None
         share: Any = None
         try:
+            thread_id = _outbound_thread_id(metadata)
             upload_result = await self._client.upload_and_share_file(
                 str(path), target_room, self.upload_folder,
                 caption=caption, reply_to=reply_to,
+                **({"thread_id": thread_id} if thread_id is not None else {}),
             )
             if len(upload_result) == 4:
                 remote_path, share, native_talk_share, atomic_metadata = upload_result
@@ -3940,8 +4311,22 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             attachment_delivered = True
             link = share.get("url") if isinstance(share, dict) else None
             delivery_result: Optional[SendResult] = None
+            if (
+                native_talk_share and not atomic_metadata and not (caption or reply_to)
+                and _outbound_thread_id(metadata) is not None
+            ):
+                # The server refused Talk metadata, so the share was posted
+                # without it and landed in the main chat.  Say so instead of
+                # losing the thread silently; there is no caption to follow up.
+                logger.warning(
+                    "[nextcloud_talk] Talk could not attach thread metadata to a file in room %s; "
+                    "the file was shared to the main chat",
+                    self._safe_room_token(target_room),
+                )
             if native_talk_share and (caption or reply_to) and not atomic_metadata:
-                delivery_result = await self.send(target_room, caption, reply_to=reply_to)
+                delivery_result = await self.send(
+                    target_room, caption, reply_to=reply_to, metadata=metadata
+                )
             elif not native_talk_share:
                 if not link:
                     return SendResult(
@@ -3955,7 +4340,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         },
                     )
                 delivery_result = await self.send(
-                    target_room, f"{caption or path.name}\n{link}", reply_to=reply_to
+                    target_room, f"{caption or path.name}\n{link}", reply_to=reply_to,
+                    metadata=metadata,
                 )
             if delivery_result is not None and not delivery_result.success:
                 return SendResult(
@@ -4037,13 +4423,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if image_ref.startswith("file://"):
             image_ref = parse.unquote(parse.urlparse(image_ref).path)
         return await self._send_tracked_media_attachment(
-            chat_id, image_ref, caption=caption, reply_to=reply_to
+            chat_id, image_ref, caption=caption, reply_to=reply_to, metadata=metadata
         )
 
     async def send_image_file(self, chat_id: str, image_path: str, caption: Optional[str] = None,
                               reply_to: Optional[str] = None, **kwargs) -> SendResult:
         return await self._send_tracked_media_attachment(
-            chat_id, image_path, caption=caption, reply_to=reply_to
+            chat_id, image_path, caption=caption, reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
         )
 
     async def send_document(self, chat_id: str, document_path: Optional[str] = None, caption: Optional[str] = None,
@@ -4051,23 +4438,28 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         file_path = str(document_path or kwargs.get("file_path") or kwargs.get("path") or "")
         if file_path.startswith(("http://", "https://")):
             text = f"{caption or 'Document'}: {file_path}"
-            return await self.send(chat_id, text, reply_to=reply_to)
+            return await self.send(
+                chat_id, text, reply_to=reply_to, metadata=kwargs.get("metadata")
+            )
         if file_path.startswith("file://"):
             file_path = parse.unquote(parse.urlparse(file_path).path)
         return await self._send_tracked_media_attachment(
-            chat_id, file_path, caption=caption, reply_to=reply_to
+            chat_id, file_path, caption=caption, reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
         )
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, **kwargs) -> SendResult:
         return await self._send_tracked_media_attachment(
-            chat_id, audio_path, caption=caption, reply_to=reply_to
+            chat_id, audio_path, caption=caption, reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
         )
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, **kwargs) -> SendResult:
         return await self._send_tracked_media_attachment(
-            chat_id, video_path, caption=caption, reply_to=reply_to
+            chat_id, video_path, caption=caption, reply_to=reply_to,
+            metadata=kwargs.get("metadata"),
         )
 
     async def get_chat_info(self, chat_id: str) -> Dict[str, Any]:

@@ -18,7 +18,7 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Inbound images, audio, and documents downloaded to the Hermes media pipeline.
 - Captioned attachments work even when Talk does not include a `{file}` placeholder.
 - Native outbound image/document sharing through WebDAV and Nextcloud Talk shares.
-- Talk-native presentation: Markdown replies, processing-status reactions (👀 → ✅/❌), read
+- Talk-native presentation: Markdown replies, a ❌ reaction on failed turns, read
   markers, silent progress messages, and TTS replies as Talk voice messages.
 - Optional public-link fallback (disabled by default) if native Talk sharing is unavailable.
 - Python standard library only at runtime.
@@ -191,6 +191,10 @@ Room ACK ledgers are persisted atomically with mode `0600` under the active prof
 Hermes cache. A message is acknowledged only after deterministic pre-dispatch ignore
 or a real Hermes `ProcessingOutcome.SUCCESS`; cancellation and shutdown leave it
 retryable.
+Only one gateway may poll/write a profile's Talk cursor at a time. On POSIX the
+adapter holds an exclusive OS writer lease until disconnect; a second gateway
+fails to connect rather than advancing a floor from an incomplete private view.
+On systems without that lease primitive, Talk fails closed at connect.
 
 Each room keeps a **prefix floor** plus exact ACKs above it. The floor advances only
 over message IDs the adapter has actually seen in that room's own history, each of
@@ -200,11 +204,14 @@ ID the server commits or reveals late is therefore still dispatched, and an
 unacknowledged ID stops the floor right below itself. Polling rescans from the floor
 without waiting, follows full pages, resumes a long sweep across cycles, and only
 then long-polls for new messages; the exact set therefore holds just the IDs above
-the floor, not the room's history, and a room never stalls on a size cap.
-`NEXTCLOUD_TALK_ACK_RETENTION_COUNT` (4,096) is only a safety bound: if more than that
-many exact ACKs pile up above a message that is still being retried (for example
-4,096 newer messages during its backoff), the floor passes it and it is given up with
-a warning naming the range.
+the floor, not the room's history. Bot-authored edit/delete system events are
+deterministic ignores: polling pages past them without storing each ID in the
+observation or exact-ACK maps. They may be rescanned after restart. If `NEXTCLOUD_TALK_ACK_RETENTION_COUNT`
+(4,096 by default) exact ACKs accumulate above an unresolved ID, the room stops
+dispatching new IDs and logs a warning instead of skipping that ID. The oldest
+observed unresolved ID can still finish or retry using bounded recovery headroom
+(one poll page); if that headroom also fills, raise the limit to resume. Capacity
+trades availability for safety.
 
 A message whose agent turn fails (handler or tool error) or that fails before
 dispatch (for example an attachment download that keeps failing) is retried with
@@ -265,14 +272,14 @@ after upgrading to a compatible plugin or explicitly moving it aside.
 - **Markdown** (`markdown`, default `true`). Talk renders chat messages as Markdown (code
   blocks, links, lists, tables), so replies are sent as written; only image embeds become their
   URL, which Talk shows as a link preview. `false` restores the older plain-text conversion.
-- **Status reactions** (`reactions`, default `groups`). The bot reacts 👀 to a message when it
-  starts working on it and swaps that for ✅ or ❌ when the turn ends. Talk notifies a message's
-  author about every reaction in one-to-one rooms, so the default limits this to group rooms
-  (where Talk notifies about reactions only at the "all messages" level). `all` adds one-to-one
-  rooms, `off` disables it. Reactions run detached from the turn on a small dedicated thread
-  pool (short HTTP time-out, bounded queue): a failed or slow reaction never delays or changes
-  the reply or its acknowledgement. A turn released by the processing time-out and not retried
-  can keep its 👀.
+- **Failure reaction** (`reactions`, default `groups`). The bot reacts ❌ to a message whose
+  turn failed; successful turns get no reaction. Talk has no silent reactions: the server
+  notifies the message's author about every new reaction (always in one-to-one rooms, at the
+  "all messages" level in group rooms), so per-turn 👀/✅ would ping on every message. The read
+  marker below already shows that the bot picked a message up. The default limits ❌ to group
+  rooms; `all` adds one-to-one rooms, `off` disables it. The reaction runs detached from the
+  turn on a small dedicated thread pool (short HTTP time-out, bounded queue): a failed or slow
+  reaction never delays or changes the reply or its acknowledgement.
 - **Read marker** (`read_marker`, default `true`). The bot marks the room read up to each
   message it accepts, so the sender sees it was picked up, and polls ask Talk not to move the
   marker on their own. Best effort and monotonic. `false` leaves the marker to Talk, which
@@ -286,6 +293,14 @@ after upgrading to a compatible plugin or explicitly moving it aside.
 - **Voice messages.** A voice reply (auto-TTS or `[[audio_as_voice]]`) in MP3 or WAV is shared as a Talk voice
   message with an inline player. Talk keeps that type only for those two formats; other audio
   is shared as an ordinary file.
+- **Editing and deleting.** The bot can edit and delete the messages it posted, so Hermes
+  updates one progress or "still working" message in place instead of posting a new one each
+  time, edits a streamed reply as it grows (when streaming is on), removes temporary previews,
+  and honours `display.ephemeral_system_ttl` and `display.cleanup_progress`. Which progress
+  Hermes shows is the usual `display.tool_progress` setting (per platform:
+  `display.platforms.nextcloud_talk.tool_progress`). Only messages this bot posted since the
+  gateway started can be changed; Talk itself allows edits for 24 hours. Every edit and deletion
+  adds a hidden Talk system message, which the bot skips.
 
 ### Threads and topics
 
@@ -461,7 +476,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.15 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.16 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

@@ -73,6 +73,11 @@ Report any way to break one of these:
 - **Presentation calls are side effects only.** Status reactions and read markers are best
   effort and time-limited; their failure or delay must never change, delay, or duplicate a
   reply, and never change what is acknowledged.
+- **Edits and deletions touch only the bot's own recent messages.** The adapter edits or
+  deletes a message only when it posted that message ID in that room during the running
+  process (bounded registry), even when the bot is a moderator who Talk would let change other
+  people's messages. A timed-out edit may be repeated with the same complete
+  text, but an ambiguous new-message POST is not blindly repeated.
 - **No public links by default.** Public share links are created only when the operator enabled
   the public-share fallback explicitly.
 - **Profile isolation.** Under the multiplexing gateway, each profile's settings and credentials

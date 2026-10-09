@@ -44,6 +44,11 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import collections
+try:
+    import fcntl  # POSIX writer lease; never permit two gateways on one cursor file.
+except ImportError:  # pragma: no cover - an unguarded platform must fail closed.
+    fcntl = None
 import concurrent.futures
 import hashlib
 import ipaddress
@@ -153,7 +158,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.15"
+_RELEASED_VERSION = "0.1.16"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -243,6 +248,10 @@ _TALK_SHARE_MESSAGE_TYPES = frozenset({"voice-message"})
 # Talk 24 keeps ``voice-message`` only for these container types (probed live:
 # Ogg/Opus and MP4 audio silently become an ordinary file share).
 _VOICE_MESSAGE_SUFFIXES = frozenset({".mp3", ".wav"})
+# Edits and deletions are limited to chat messages this adapter posted in the
+# running process.  A moderator bot could otherwise edit or delete other
+# people's messages if Hermes ever handed it a foreign message ID.
+_SENT_MESSAGE_RETENTION = 4096
 # Presentation calls (reactions, read marker) run detached from the turn on a
 # small dedicated pool with a short HTTP time-out, so a slow server can neither
 # delay a reply nor occupy the default executor that polls and sends share.
@@ -976,9 +985,10 @@ class NextcloudTalkClient:
             raise NextcloudTalkAPIError("unexpected OCS data type", category="protocol")
         return data
 
-    def _url(self, room_token: str, query: Optional[Dict[str, Any]] = None) -> str:
+    def _url(self, room_token: str, query: Optional[Dict[str, Any]] = None,
+             suffix: str = "") -> str:
         encoded_token = parse.quote(str(room_token).strip("/"), safe="")
-        url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v1/chat/{encoded_token}"
+        url = f"{self.base_url}/ocs/v2.php/apps/spreed/api/v1/chat/{encoded_token}{suffix}"
         if query:
             cleaned = {k: v for k, v in query.items() if v is not None}
             url += "?" + parse.urlencode(cleaned)
@@ -986,14 +996,18 @@ class NextcloudTalkClient:
 
     def _request(self, method: str, room_token: str, *, query: Optional[Dict[str, Any]] = None,
                  data: Optional[Dict[str, Any]] = None,
-                 expected_types: Optional[tuple[type, ...]] = None) -> Any:
+                 expected_types: Optional[tuple[type, ...]] = None,
+                 suffix: str = "") -> Any:
         body = None
         headers = dict(self._headers)
         if data is not None:
             body = parse.urlencode(data).encode("utf-8")
             headers["Content-Type"] = "application/x-www-form-urlencoded"
 
-        req = request.Request(self._url(room_token, query), data=body, headers=headers, method=method)
+        req = request.Request(
+            self._url(room_token, query, suffix),
+            data=body, headers=headers, method=method,
+        )
         try:
             with self._open_authenticated(req) as resp:
                 parsed_payload = self._read_json(resp)
@@ -1129,6 +1143,20 @@ class NextcloudTalkClient:
             self._ocs_get, endpoint, {"limit": int(limit)}, expected_types=(list,)
         )
         return [item for item in data if isinstance(item, dict)]
+
+    async def edit_message(self, room_token: str, message_id: int, message: str) -> Any:
+        """Replace the text of a chat message (Talk: own messages, up to 24 hours old)."""
+        return await asyncio.to_thread(
+            self._request, "PUT", room_token, data={"message": message},
+            expected_types=(dict,), suffix=f"/{int(message_id)}",
+        )
+
+    async def delete_message(self, room_token: str, message_id: int) -> Any:
+        """Delete a chat message (Talk leaves a "message deleted" placeholder)."""
+        return await asyncio.to_thread(
+            self._request, "DELETE", room_token, expected_types=(dict,),
+            suffix=f"/{int(message_id)}",
+        )
 
     async def supports_threads(self) -> bool:
         data = await asyncio.to_thread(
@@ -1880,10 +1908,12 @@ class NextcloudTalkClient:
 class NextcloudTalkAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = _DEFAULT_MAX_MESSAGE_LENGTH
     splits_long_messages = True
-    # Processing status as reactions on the user's message (Base swaps the
-    # in-progress reaction for the outcome one in on_processing_complete).
-    _ACK_EMOJI = "👀"
-    _OK_EMOJI = "✅"
+    # Failure-only status reaction. Talk has no silent reaction: the server
+    # notifies the message author about each new one, so 👀/✅ on every turn
+    # would ping on every message. Base's completion hook adds ❌ on failure;
+    # with no in-progress emoji its "remove" step sends no request.
+    _ACK_EMOJI = None
+    _OK_EMOJI = None
     _FAIL_EMOJI = "❌"
 
     _DETERMINISTIC_ATTACHMENT_CATEGORIES = {
@@ -1923,6 +1953,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._read_marker_done: Dict[str, int] = {}
         self._read_marker_tasks: Dict[str, asyncio.Task] = {}
         self._presentation_tasks: Set[asyncio.Task] = set()
+        self._sent_message_ids: "collections.OrderedDict[tuple[str, int], None]" = (
+            collections.OrderedDict()
+        )
         # Legacy PROCESS_HISTORY=true means unlimited first-run backfill.  The
         # safe default is a documented bounded backlog, never "skip to latest".
         self.process_history = _truthy(
@@ -2243,7 +2276,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if not isinstance(metadata, dict) or metadata.get("nextcloud_talk_message_id") is None:
             return  # only real Talk messages get a status reaction
         chat_id = getattr(event.source, "chat_id", None)
-        if not isinstance(chat_id, str) or not self._reactions_enabled_for(chat_id):
+        if (not self._ACK_EMOJI or not isinstance(chat_id, str)
+                or not self._reactions_enabled_for(chat_id)):
             return
         # Never awaited here: Base runs this hook before the handler, so an
         # awaited slow reaction would delay the reply itself.
@@ -2254,7 +2288,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def _swap_status_reaction(self, base_hook: Any, event: MessageEvent,
                                     outcome: ProcessingOutcome,
                                     start_task: Optional[asyncio.Task]) -> None:
-        """Replace 👀 with the outcome reaction once the 👀 call has finished."""
+        """Run Base's outcome reaction (❌ on failure) after any in-progress reaction call."""
         if start_task is not None and not start_task.done():
             # The add call is bounded by its own guard; waiting for it keeps
             # the later remove from overtaking it on the server.
@@ -2386,6 +2420,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
 
     async def connect(self, **kwargs) -> bool:
+        if self._poll_task is not None and not self._poll_task.done():
+            return True  # an existing connection owns both poller and lease
+        if getattr(self, "_cursor_writer_fd", None) is not None:
+            return False  # a failed poller must be disconnected before reconnect
         if not validate_config(self.config):
             self._set_fatal_error(
                 "config_missing",
@@ -2429,6 +2467,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return False
 
         try:
+            self._claim_cursor_writer()
             self._load_cursors()
             # Room metadata is useful even when DM auto-discovery is disabled:
             # explicit type-1 rooms must still be classified as DMs.
@@ -2447,7 +2486,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             logger.info("[nextcloud_talk] Connected to rooms: %s", rooms_safe)
             self._mark_connected()
             return True
-        except Exception as exc:
+        except BaseException as exc:
+            self._running = False
+            topics_task = getattr(self, "_topics_task", None)
+            if topics_task is not None:
+                topics_task.cancel()
+                await asyncio.gather(topics_task, return_exceptions=True)
+                self._topics_task = None
+            poll_task = getattr(self, "_poll_task", None)
+            if poll_task is not None:
+                poll_task.cancel()
+                await asyncio.gather(poll_task, return_exceptions=True)
+                self._poll_task = None
+            self._release_cursor_writer()
+            if not isinstance(exc, Exception):
+                raise  # cancellation must not leave a stale writer lease
             safe_error = _safe_outward_error_text(exc)
             logger.error("[nextcloud_talk] Failed to connect: %s", safe_error)
             self._set_fatal_error("connect_failed", safe_error, retryable=True)
@@ -2522,6 +2575,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._generation_outcomes.clear()
         self._inflight_message_ids.clear()
         self._initializing_rooms.clear()
+        self._release_cursor_writer()
         self._mark_disconnected()
         logger.info("[nextcloud_talk] Disconnected")
 
@@ -2917,16 +2971,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             floor = max(floor, max(successful) - self.ack_overlap_ids)
         successful = {value for value in successful if value > floor}
         if len(successful) > self.ack_retention_count:
-            # Only reachable after a floor stall far larger than any poll page;
-            # keep the newest exact ACKs and surface it rather than growing
-            # without bound.
-            kept = sorted(successful)[-self.ack_retention_count:]
-            old_floor = floor
-            floor = max(floor, kept[0] - 1)
-            successful = set(kept)
+            # A historic cursor may exceed a newly configured limit. Keep its
+            # exact ACKs; capacity pressure cannot justify crossing a gap.
             logger.warning(
-                "[nextcloud_talk] Exact ACK retention exceeded; floor advanced from %d to %d "
-                "and any unacknowledged ID in that range is given up", old_floor, floor,
+                "[nextcloud_talk] Exact ACK retention exceeded; new IDs held until "
+                "the prefix settles or the limit is raised",
             )
         state["floor"] = floor
         state["successful"] = successful
@@ -2954,6 +3003,37 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 for token, state in sorted(self._ack_rooms.items())
             },
         }
+
+    def _claim_cursor_writer(self) -> None:
+        """Hold an exclusive OS lease for this profile's cursor across polling.
+
+        The prefix relies on this writer's observed history. A second gateway
+        with an independent volatile view cannot safely merge numeric floors.
+        """
+        if getattr(self, "_cursor_writer_fd", None) is not None:
+            return
+        if fcntl is None:
+            raise CursorCacheError("OS cursor writer lease unavailable")
+        path = self._cursor_path.with_name("cursors.writer.lock")
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0), 0o600)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                raise CursorCacheError("cursor writer lease is not a regular file")
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            except BlockingIOError as exc:
+                raise CursorCacheError("another gateway owns the Talk cursor") from exc
+            self._cursor_writer_fd = fd
+        except BaseException:
+            os.close(fd)
+            raise
+
+    def _release_cursor_writer(self) -> None:
+        fd = getattr(self, "_cursor_writer_fd", None)
+        if fd is not None:
+            self._cursor_writer_fd = None
+            os.close(fd)  # closing the handle releases flock even after cancellation
 
     def _persist_cursors(self) -> None:
         try:
@@ -3075,6 +3155,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 if backup_path is not None:
                     backup_path.unlink(missing_ok=True)
 
+    def _is_recovery_barrier(self, room_token: str, numeric_id: int,
+                             state: Dict[str, Any]) -> bool:
+        """Allow only the oldest observed gap to resolve a full exact ledger."""
+        successful = state.get("successful", set())
+        if len(successful) >= self.ack_retention_count + self.max_poll_batch:
+            return False  # bounded recovery headroom; operator can raise limit
+        floor = int(state.get("floor", 0))
+        seen = self._room_seen_ids.get(room_token, {})
+        return numeric_id == next(
+            (mid for mid in sorted(seen) if mid > floor and mid not in successful),
+            None,
+        )
+
     def _commit_cursor(self, room_token: str, numeric_id: Optional[int]) -> None:
         """Durably acknowledge one deterministic/successfully processed ID."""
         numeric_id = _strict_talk_message_id(numeric_id)
@@ -3100,6 +3193,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     self._persist_cursors()
                     self._ack_state_dirty = False
                 return
+            if (len(old_successful) >= self.ack_retention_count
+                    and not self._is_recovery_barrier(room_token, numeric_id, state)):
+                raise CursorCacheError("exact ACK capacity exhausted; raise retention limit")
             snapshot = {
                 "floor": floor,
                 "successful": set(old_successful),
@@ -3154,8 +3250,25 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             for message_id in [m for m in seen if m <= floor]:
                 del seen[message_id]
             if len(seen) > limit:
-                for message_id in sorted(seen)[: len(seen) - limit]:
-                    del seen[message_id]
+                state = self._ack_rooms.get(room_token, {})
+                handled = state.get("successful", set())
+                # The oldest *unresolved* observed ID is a floor barrier.
+                # Evict only already-handled observations; their exact ACK is
+                # still available for the next sweep.
+                for message_id in sorted(seen):
+                    if len(seen) <= limit:
+                        break
+                    if message_id in handled:
+                        del seen[message_id]
+                if len(seen) > limit:
+                    # A page with too many unresolved IDs cannot be safely
+                    # remembered. Stop intake instead of losing its barriers.
+                    for message_id in sorted(seen, reverse=True)[: len(seen) - limit]:
+                        del seen[message_id]
+                    raise NextcloudTalkAPIError(
+                        "room observation capacity exhausted; unresolved IDs retained",
+                        category="overflow",
+                    )
 
     def _advance_floor(self, room_token: str, state: Dict[str, Any]) -> bool:
         """Advance the floor over the contiguous ACKed prefix of observed history.
@@ -3262,6 +3375,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                      "_retry_not_before", "_poll_page_limits", "_sweep_completed_from",
                      "_read_marker_done", "_read_marker_pending"):
             getattr(self, name, {}).pop(room_token, None)
+
+    def _is_own_presentation_event(self, msg: Any) -> bool:
+        """Talk's bot-authored edit/delete events are safe to ignore on replay."""
+        return (
+            isinstance(msg, dict)
+            and isinstance(msg.get("systemMessage"), str)
+            and msg["systemMessage"] in {"message_edited", "message_deleted"}
+            and isinstance(msg.get("actorId"), str)
+            and msg["actorId"].lower() == self.username.lower()
+        )
 
     def _retry_deferred(self, room_token: str, numeric_id: int) -> bool:
         due = self._retry_not_before.get(room_token, {}).get(numeric_id)
@@ -3604,6 +3727,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 normalized_batch: Dict[int, dict] = {}
                 malformed_count = 0
                 valid_ids: List[int] = []
+                observed_ids: List[int] = []
                 for msg in batch:
                     if not isinstance(msg, dict):
                         malformed_count += 1
@@ -3613,10 +3737,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         malformed_count += 1
                         continue
                     valid_ids.append(message_id)
+                    if self._is_own_presentation_event(msg):
+                        # These are re-identifiable after a restart and never
+                        # need a volatile observation or a durable exact ACK.
+                        continue
+                    observed_ids.append(message_id)
                     if (not self._is_acknowledged(room_token, message_id)
                             and not self._retry_deferred(room_token, message_id)):
                         normalized_batch[message_id] = msg
-                self._observe_room_ids(room_token, valid_ids)
+                self._observe_room_ids(room_token, observed_ids)
                 return normalized_batch, malformed_count, valid_ids
 
             cycle_dispatched: set[int] = set()
@@ -3626,6 +3755,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     # One dispatch per ID per poll cycle, even if a page repeats.
                     if message_id in cycle_dispatched:
                         continue
+                    state = self._ack_rooms.get(room_token, {})
+                    if len(state.get("successful", ())) >= self.ack_retention_count:
+                        self._settle_room_floor(room_token)
+                        state = self._ack_rooms.get(room_token, {})
+                        if (len(state.get("successful", ())) >= self.ack_retention_count
+                                and not self._is_recovery_barrier(room_token, message_id, state)):
+                            logger.warning(
+                                "[nextcloud_talk] Room %s intake held: exact ACK capacity reached",
+                                self._safe_room_token(room_token),
+                            )
+                            return
                     cycle_dispatched.add(message_id)
                     try:
                         await self._handle_talk_message(batch[message_id], room_token)
@@ -4152,6 +4292,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 )
                 self._commit_cursor(room_token, numeric_id)
                 return
+        if self._is_own_presentation_event(msg):
+            # Direct calls share the poller's deterministic skip contract.
+            return
         if (not text and not file_refs) or system_message:
             self._commit_cursor(room_token, numeric_id)
             return
@@ -4576,6 +4719,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         "Talk send returned an invalid message ID", category="protocol"
                     )
                 message_ids.append(str(talk_id))
+                self._remember_sent_message(target_room, talk_id)
                 await asyncio.sleep(0.15)
             return SendResult(
                 success=True,
@@ -4608,6 +4752,98 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 raw_response={"partial_delivery": bool(message_ids), "delivered_message_ids": message_ids},
             )
 
+    def _remember_sent_message(self, room_token: str, message_id: int) -> None:
+        sent = getattr(self, "_sent_message_ids", None)
+        if sent is None:
+            sent = self._sent_message_ids = collections.OrderedDict()
+        key = (str(room_token), int(message_id))
+        sent[key] = None
+        sent.move_to_end(key)
+        while len(sent) > _SENT_MESSAGE_RETENTION:
+            sent.popitem(last=False)
+
+    def _own_message_id(self, chat_id: Any, message_id: Any) -> Optional[int]:
+        """The numeric ID when this adapter posted ``message_id`` in ``chat_id``."""
+        if not isinstance(chat_id, str) or not chat_id:
+            return None
+        if isinstance(message_id, str) and message_id.isascii() and message_id.isdigit() \
+                and len(message_id) <= 19:
+            message_id = int(message_id)
+        numeric_id = _strict_talk_message_id(message_id)
+        if numeric_id is None:
+            return None
+        sent = getattr(self, "_sent_message_ids", None) or {}
+        return numeric_id if (chat_id, numeric_id) in sent else None
+
+    def max_message_length_for_chat(self, chat_id: str) -> int:
+        """Expose the configured Talk limit to Hermes' progress/stream splitters."""
+        return self.max_message_length
+
+    async def edit_message(self, chat_id: str, message_id: str, content: str, *,
+                           finalize: bool = False, **_kwargs: Any) -> SendResult:
+        """Replace the text of a message this adapter sent (progress, streaming previews).
+
+        Talk allows edits of one's own messages for 24 hours; every refusal is
+        reported as a non-retryable failure, so Hermes falls back to a new message.
+        A timed-out edit may be repeated with the same full text (unlike a POST);
+        this lets Hermes keep updating a single tool-progress bubble.
+        """
+        client = self._client
+        if client is None or not callable(getattr(client, "edit_message", None)):
+            return SendResult(success=False, error="Not supported", retryable=False)
+        numeric_id = self._own_message_id(chat_id, message_id)
+        if numeric_id is None:
+            return SendResult(
+                success=False, error="Message was not sent by this adapter", retryable=False
+            )
+        text = _talk_text(content, markdown=getattr(self, "markdown", True))
+        if not text.strip():
+            return SendResult(success=False, error="Edited message is empty", retryable=False)
+        if len(text) > self.max_message_length:
+            return SendResult(success=False, error="Edited message is too long", retryable=False)
+        try:
+            await client.edit_message(chat_id, numeric_id, text)
+        except NextcloudTalkAPIError as exc:
+            if exc.category == "network":
+                return SendResult(
+                    success=False, error="edit outcome unknown (write timed out)",
+                    retryable=True, raw_response={"category": "ambiguous_delivery"},
+                )
+            return SendResult(
+                success=False, error=_safe_outward_error_text(exc), retryable=False
+            )
+        except Exception as exc:
+            return SendResult(
+                success=False, error=_safe_outward_error_text(exc), retryable=False
+            )
+        return SendResult(success=True, message_id=str(numeric_id))
+
+    async def delete_message(self, chat_id: str, message_id: str) -> bool:
+        """Delete a message this adapter sent; True when it is gone."""
+        client = self._client
+        if client is None or not callable(getattr(client, "delete_message", None)):
+            return False
+        numeric_id = self._own_message_id(chat_id, message_id)
+        if numeric_id is None:
+            return False
+        try:
+            await client.delete_message(chat_id, numeric_id)
+        except NextcloudTalkAPIError as exc:
+            if exc.status_code != 404:  # 404: already gone
+                logger.debug(
+                    "[nextcloud_talk] Delete failed in room %s: %s",
+                    self._safe_room_token(chat_id), _safe_outward_error_text(exc),
+                )
+                return False
+        except Exception as exc:
+            logger.debug(
+                "[nextcloud_talk] Delete failed in room %s: %s",
+                self._safe_room_token(chat_id), _safe_outward_error_text(exc),
+            )
+            return False
+        self._sent_message_ids.pop((chat_id, numeric_id), None)
+        return True
+
     def _send_silently(self, metadata: Any) -> bool:
         """In ``important`` mode only final replies and prompts notify.
 
@@ -4620,6 +4856,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return False
         if isinstance(metadata, dict) and (
             metadata.get("notify") or metadata.get("is_approval_prompt")
+            or (metadata.get("expect_edits") and not metadata.get("_interim_send"))
         ):
             return False
         return True

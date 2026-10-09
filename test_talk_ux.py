@@ -166,14 +166,15 @@ class StatusReactionTests(_Base):
         await self.wait_for_background(instance)
         await _drain_presentation(instance)
 
-    async def test_group_turn_gets_eyes_then_check(self):
+    async def test_successful_turn_sends_no_reaction(self):
+        # Talk notifies the author about every reaction and has no silent
+        # mode, so a normal turn must not react at all.
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)
             client = instance._client = _UXClient()
             await self.run_turn(instance, _msg(611))
-            self.assertEqual(client.reactions, [
-                ("add", "room", 611, "👀"), ("remove", "room", 611, "👀"), ("add", "room", 611, "✅"),
-            ])
+            self.assertEqual(client.reactions, [])
+            self.assertEqual(len([c for c in client.sent if c[1] == "answer"]), 1)
 
     async def test_one_to_one_room_has_no_reactions_by_default(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -184,19 +185,21 @@ class StatusReactionTests(_Base):
             self.assertEqual(client.reactions, [])
             self.assertEqual(len([c for c in client.sent if c[1] == "answer"]), 1)
 
-    async def test_reactions_all_includes_one_to_one(self):
+    async def test_reactions_all_marks_one_to_one_failures(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp, reactions=True)
             instance._room_types = {"room": 1}
             client = instance._client = _UXClient()
             await self.run_turn(instance, _msg(613))
-            self.assertEqual([r[3] for r in client.reactions], ["👀", "👀", "✅"])
+            self.assertEqual(client.reactions, [])
+            await self.run_turn(instance, _msg(618), result=RuntimeError("boom"))
+            self.assertEqual(client.reactions, [("add", "room", 618, "❌")])
 
     async def test_reactions_off(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp, reactions="off")
             client = instance._client = _UXClient()
-            await self.run_turn(instance, _msg(614))
+            await self.run_turn(instance, _msg(614), result=RuntimeError("boom"))
             self.assertEqual(client.reactions, [])
 
     async def test_unknown_room_type_gets_no_reaction(self):
@@ -204,17 +207,15 @@ class StatusReactionTests(_Base):
             instance = self.make_adapter(tmp)
             instance._room_types = {}
             client = instance._client = _UXClient()
-            await self.run_turn(instance, _msg(615))
+            await self.run_turn(instance, _msg(615), result=RuntimeError("boom"))
             self.assertEqual(client.reactions, [])
 
-    async def test_failed_turn_gets_cross(self):
+    async def test_failed_turn_gets_only_cross(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)
             client = instance._client = _UXClient()
             await self.run_turn(instance, _msg(616), result=RuntimeError("boom"))
-            self.assertEqual(client.reactions[0][3], "👀")
-            self.assertIn(("add", "room", 616, "❌"), client.reactions)
-            self.assertNotIn(("add", "room", 616, "✅"), client.reactions)
+            self.assertEqual(client.reactions, [("add", "room", 616, "❌")])
 
     async def test_reaction_errors_never_block_reply_or_ack(self):
         for error, delay in ((adapter.NextcloudTalkAPIError("HTTP 500", status_code=500), None),
@@ -232,6 +233,7 @@ class StatusReactionTests(_Base):
 
                 instance._commit_cursor = spy
                 await self.run_turn(instance, _msg(617))
+                await self.run_turn(instance, _msg(619), result=RuntimeError("boom"))
                 self.assertEqual(len([c for c in client.sent if c[1] == "answer"]), 1)
                 self.assertIn(617, committed)
 
@@ -239,8 +241,8 @@ class StatusReactionTests(_Base):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)
             client = instance._client = _UXClient()
-            await self.run_turn(instance, _thread_msg(625, 620))
-            self.assertEqual(client.reactions[0], ("add", "room", 625, "👀"))
+            await self.run_turn(instance, _thread_msg(625, 620), result=RuntimeError("boom"))
+            self.assertEqual(client.reactions, [("add", "room", 625, "❌")])
 
     def test_reaction_mode_parsing(self):
         for raw, mode in ((None, "groups"), ("", "groups"), ("groups", "groups"), (True, "all"),
@@ -379,6 +381,8 @@ class PresentationLatencyTests(_Base):
             client.send_message = send_message
 
             async def handler(event):
+                if event.message_id == "701":
+                    raise RuntimeError("boom")  # its ❌ reaction hangs
                 return "answer-" + event.message_id
 
             instance.set_message_handler(handler)
@@ -387,33 +391,11 @@ class PresentationLatencyTests(_Base):
             # A second turn in the same session starts right after the first.
             await instance._handle_talk_message(_msg(702), "room")
             await self.wait_for_background(instance)
-            self.assertEqual([m for m, _ in sent_at], ["answer-701", "answer-702"])
+            self.assertIn("answer-702", [m for m, _ in sent_at])
             self.assertLess(max(t for _, t in sent_at), 1.0)
             self.assertTrue(instance._presentation_tasks)  # still hanging, detached
             await instance.disconnect()
             self.assertFalse(instance._presentation_tasks)
-
-    async def test_swap_waits_for_the_eyes_call(self):
-        with tempfile.TemporaryDirectory() as tmp:
-            instance = self.make_adapter(tmp)
-            client = instance._client = _UXClient()
-            gate = asyncio.Event()
-            orig = client._react
-
-            async def react(kind, room, message_id, emoji):
-                if kind == "add" and emoji == "👀":
-                    await gate.wait()
-                await orig(kind, room, message_id, emoji)
-
-            client._react = react
-            instance.set_message_handler(lambda _event: asyncio.sleep(0, result="answer"))
-            await instance._handle_talk_message(_msg(703), "room")
-            await self.wait_for_background(instance)
-            self.assertEqual(client.reactions, [])
-            gate.set()
-            await _drain_presentation(instance)
-            self.assertEqual([(r[0], r[3]) for r in client.reactions],
-                             [("add", "👀"), ("remove", "👀"), ("add", "✅")])
 
     async def test_stuck_presentation_requests_leave_default_executor_free(self):
         client = adapter.NextcloudTalkClient("https://cloud.example", "bot", "secret")

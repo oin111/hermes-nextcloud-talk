@@ -2,6 +2,41 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.16] - 2026-10-09 (UTC)
+
+### Added
+
+- Message editing and deletion (`edit_message` / `delete_message`). Hermes now updates one
+  progress or "still working" message in place, edits streamed replies as they grow (when
+  streaming is enabled), removes stale previews, and can auto-delete ephemeral replies and
+  progress bubbles (`display.ephemeral_system_ttl`, `display.cleanup_progress`).
+- Only messages this bot posted in that room since the gateway started are edited or deleted
+  (bounded registry), so a moderator bot never changes other people's messages. Talk refusals
+  (24-hour edit window, permissions, size) are final failures, and Hermes falls back to a new
+  message. A timed-out edit may be repeated with the same complete text (unlike a
+  non-idempotent send), so transient failures do not turn progress into a flood
+  of separate messages.
+- Streamed answers notify on their initial post: Talk does not notify on edits.
+  Bot-authored edit/delete system events are skipped without filling the durable
+  exact-ACK ledger behind an unfinished turn.
+- Exhausted exact-ACK capacity now holds new intake rather than moving the prefix
+  past a retryable message; the oldest unresolved ID can use bounded recovery
+  headroom, and an operator can raise the limit if that also fills.
+- Hold a profile-scoped cursor-writer lease for the life of the connection so
+  concurrent gateways cannot independently advance a floor past unseen work.
+
+### Changed
+
+- Tool progress now appears in Talk. Hermes skips tool progress on platforms that cannot edit,
+  so with editing available the `display.tool_progress` setting (global or
+  `display.platforms.nextcloud_talk`) takes effect: one silent progress message per turn,
+  edited in place. Set `display.platforms.nextcloud_talk.tool_progress: off` for the previous
+  behaviour.
+- Status reactions are failure-only: no more 👀 while working and ✅ on success, only ❌ when a
+  turn fails. Talk cannot post a reaction silently and notifies the author about each one, so
+  👀/✅ caused a notification on every message; the read marker still shows that a message was
+  picked up. `reactions` keeps its values (`groups`, `all`, `off`) and governs where ❌ appears.
+
 ## [0.1.15] - 2026-10-09 (UTC)
 
 ### Added

@@ -477,7 +477,7 @@ class ThreadTopicTests(_Base):
                 await instance.disconnect()
                 self.assertTrue(task.cancelled() or task.done())
 
-    async def test_repeated_connect_cancels_previous_topic_task(self):
+    async def test_repeated_connect_reuses_topic_and_poll_tasks(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp, thread_topics=self.TOPICS[:1])
 
@@ -492,17 +492,18 @@ class ThreadTopicTests(_Base):
                     patch.object(instance, "_poll_loop", slow):
                 self.assertTrue(await instance.connect())
                 first = instance._topics_task
+                first_poll = instance._poll_task
                 await asyncio.sleep(0)
                 self.assertTrue(await instance.connect())
                 second = instance._topics_task
                 try:
-                    self.assertIsNot(first, second)
-                    self.assertTrue(first.done())
+                    self.assertIs(first, second)
+                    self.assertIs(instance._poll_task, first_poll)
+                    self.assertFalse(first.done())
                 finally:
                     await instance.disconnect()
-                    old_poll = getattr(instance, "_poll_task", None)
-                    if old_poll is not None:
-                        old_poll.cancel()
+                    self.assertTrue(first.done())
+                    self.assertTrue(first_poll.done())
 
     async def test_each_topic_is_persisted_before_a_later_timeout(self):
         with tempfile.TemporaryDirectory() as tmp:

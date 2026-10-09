@@ -6,6 +6,11 @@ Please do not open a public issue for credential disclosure, authentication bypa
 
 Report the issue privately through GitHub's **Security → Report a vulnerability** feature for this repository. Include affected versions, reproduction steps, and impact when possible.
 
+## Threat model
+
+See [THREAT_MODEL.md](THREAT_MODEL.md) for the assets, the inputs treated as hostile, the
+properties the adapter must keep, what is out of scope, and the severity rubric used for reports.
+
 ## Deployment notes
 
 This plugin runs inside Hermes Gateway and uses a Nextcloud user's credentials. Operators should use a dedicated account, an app password, restrictive Talk room membership, and `NEXTCLOUD_TALK_ALLOWED_USERS`.

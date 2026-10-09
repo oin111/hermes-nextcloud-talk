@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Documentation
+
+- `THREAT_MODEL.md`: assets, hostile inputs, required security properties, scope, and the severity
+  rubric for reviewers and automated scanners; linked from `SECURITY.md`.
+
 ## [0.1.14] - 2026-10-08 (UTC)
 
 ### Added

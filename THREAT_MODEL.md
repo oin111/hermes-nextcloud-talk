@@ -70,6 +70,9 @@ Report any way to break one of these:
   is not newer than the message. Each thread has its own session. A thread's configured skill and
   prompt apply only to the thread this bot created or adopted, never to another thread with the
   same title.
+- **Presentation calls are side effects only.** Status reactions and read markers are best
+  effort and time-limited; their failure or delay must never change, delay, or duplicate a
+  reply, and never change what is acknowledged.
 - **No public links by default.** Public share links are created only when the operator enabled
   the public-share fallback explicitly.
 - **Profile isolation.** Under the multiplexing gateway, each profile's settings and credentials

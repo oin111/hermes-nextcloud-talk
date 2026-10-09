@@ -2,7 +2,39 @@
 
 All notable changes to this project will be documented here.
 
-## [Unreleased]
+## [0.1.15] - 2026-10-09 (UTC)
+
+### Added
+
+- Status reactions: 👀 while a turn runs, then ✅ or ❌ (Hermes' processing hooks). Default
+  `reactions: groups`, because Talk notifies the author about every reaction in one-to-one
+  rooms; `all` / `off` switch it. Reaction and read-marker calls run detached from the turn
+  on a small dedicated thread pool with a short HTTP time-out and a bounded queue, so a slow
+  server never delays a reply and never ties up the threads that polls and sends use.
+- Read marker: an accepted message marks the room read up to its ID (monotonic, best effort,
+  `read_marker`). With it on, polls ask Talk not to move the marker itself, so messages the bot
+  skips (not allowed, system) no longer count as read; `read_marker: false` keeps Talk's own
+  marker handling.
+- Silent sends: in the default `notifications: important` mode, only sends Hermes marks as a
+  final reply (`notify`) or as an approval/clarify prompt notify; other chat messages use Talk's
+  `silent` flag, including the main-chat retry of a rejected thread send. The caption or link
+  message that accompanies a final attachment inherits its `notify`. File shares follow the
+  same rule through Talk's `silent` share metadata (`media-caption` capability); a server that
+  refuses the metadata gets a plain, notifying share. The turn-error notice carries no `notify`
+  and is silent.
+- Voice replies in MP3/WAV (auto-TTS and `[[audio_as_voice]]`) are shared as Talk voice
+  messages (`messageType: voice-message`); Talk keeps that type only for those formats (probed
+  on Talk 24).
+
+### Changed
+
+- Replies keep their Markdown (code blocks, links, lists, tables), which Talk renders; only
+  image embeds become their URL. `markdown: false` restores the plain-text conversion. The
+  platform hint tells the model that Markdown is rendered. Long replies are split without
+  breaking code blocks: a chunk ending inside a fence closes it and the next one reopens it, and
+  indentation at chunk edges is kept.
+- Default notification behaviour: progress, status and tool messages are now silent. Set
+  `notifications: all` for the previous behaviour.
 
 ### Documentation
 

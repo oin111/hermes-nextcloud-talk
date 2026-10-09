@@ -44,6 +44,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import concurrent.futures
 import hashlib
 import ipaddress
 import inspect
@@ -152,7 +153,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.14"
+_RELEASED_VERSION = "0.1.15"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -238,6 +239,22 @@ _MAX_TOPIC_PROMPT_LENGTH = 4000
 _MAX_TOPIC_SKILLS = 16
 _THREAD_TOPICS_TIMEOUT = 120.0
 _THREAD_TOPICS_LOOKUP_LIMIT = 50  # Talk rejects a larger page with HTTP 400
+_TALK_SHARE_MESSAGE_TYPES = frozenset({"voice-message"})
+# Talk 24 keeps ``voice-message`` only for these container types (probed live:
+# Ogg/Opus and MP4 audio silently become an ordinary file share).
+_VOICE_MESSAGE_SUFFIXES = frozenset({".mp3", ".wav"})
+# Presentation calls (reactions, read marker) run detached from the turn on a
+# small dedicated pool with a short HTTP time-out, so a slow server can neither
+# delay a reply nor occupy the default executor that polls and sends share.
+# The outer asyncio guards are larger than the worst queued wait
+# (queue / workers * HTTP time-out + own call), so a call is only abandoned
+# after its worker thread has finished: no late POST can overtake a later call.
+_PRESENTATION_HTTP_TIMEOUT = 5.0
+_PRESENTATION_WORKERS = 2
+_PRESENTATION_MAX_PENDING = 4
+_STATUS_REACTION_TIMEOUT = 20.0
+_READ_MARKER_TIMEOUT = 20.0
+_NOTIFICATION_MODES = frozenset({"all", "important"})
 # Talk renders a file share whose node cannot be resolved inside the current
 # request as "*{actor} shared a file which is no longer available*" and drops
 # the ``file`` parameter.  A long-poll request that set up the bot's filesystem
@@ -478,6 +495,53 @@ def _sanitize_reply_field(value: str, limit: int) -> str:
         "?" if unicodedata.category(character) in {"Cc", "Cf", "Cs"} else character
         for character in value
     )[:limit]
+
+
+def _reaction_mode(value: Any) -> str:
+    """``all``, ``groups`` (default) or ``off`` for processing-status reactions.
+
+    Talk notifies a message's author about every reaction in one-to-one rooms,
+    so the default keeps status reactions to group rooms, where Talk notifies
+    about reactions only at the "all messages" level.
+    """
+    if value is None or (isinstance(value, str) and not value.strip()):
+        return "groups"
+    text = str(value).strip().lower()
+    if text in {"groups", "group"}:
+        return "groups"
+    if text in {"all", "true", "1", "yes", "on"} or value is True:
+        return "all"
+    if text in {"off", "false", "0", "no", "none"} or value is False:
+        return "off"
+    logger.warning(
+        "[nextcloud_talk] Unknown reactions mode %r; using 'groups' (valid: all, groups, off)",
+        _safe_log_text(text, 32),
+    )
+    return "groups"
+
+
+def _talk_text(text: str, *, markdown: bool = True) -> str:
+    """Prepare Hermes text for Talk.
+
+    Talk renders chat messages as extended Markdown (code blocks, links, lists,
+    tables), so only image embeds, which Talk does not display, become their
+    URL (Talk previews it).  ``markdown=False`` keeps the plain-text conversion.
+    """
+    if not markdown:
+        return _strip_rich_text(text)
+    text = re.sub(r"!\[([^\]]*)\]\(([^)\s]+)\)", r"\2", text or "")
+    # Keep leading indentation: it can be an indented code block.
+    return text.strip("\r\n").rstrip()
+
+
+def _open_code_fence(text: str) -> Optional[str]:
+    """The opening line of a ``` fence still open at the end of ``text``."""
+    opener: Optional[str] = None
+    for line in text.split("\n"):
+        stripped = line.strip()
+        if stripped.startswith("```"):
+            opener = None if opener is not None else stripped[:64]
+    return opener
 
 
 def _strip_rich_text(text: str) -> str:
@@ -760,6 +824,9 @@ class NextcloudTalkClient:
         self.max_json_bytes = max(1, int(max_json_bytes))
         self.max_body_bytes = max(1, int(max_body_bytes))
         self.max_poll_batch = _normalize_poll_batch(max_poll_batch)
+        # True: polls tell Talk not to move the read marker (the adapter sets
+        # it itself, only for messages it accepted).
+        self.explicit_read_marker = False
         self.max_rooms = max(1, int(max_rooms))
         self.max_cache_bytes = max(0, int(max_cache_bytes))
         self.max_cache_files = max(0, int(max_cache_files))
@@ -768,6 +835,9 @@ class NextcloudTalkClient:
         self._cache_guard = threading.RLock()
         self._cache_inflight: Dict[str, int] = {}
         self._cache_leases: Dict[str, int] = {}
+        self._presentation_guard = threading.Lock()
+        self._presentation_pool: Optional[concurrent.futures.ThreadPoolExecutor] = None
+        self._presentation_pending = 0
         self._base_origin = self._origin(self.base_url)
         token = base64.b64encode(f"{username}:{password}".encode("utf-8")).decode("ascii")
         self._headers = {
@@ -832,7 +902,7 @@ class NextcloudTalkClient:
         except (TypeError, ValueError):
             return None
 
-    def _open_authenticated(self, req: request.Request):
+    def _open_authenticated(self, req: request.Request, *, timeout: Optional[float] = None):
         try:
             initial_origin = self._origin(req.full_url)
         except (TypeError, ValueError) as exc:
@@ -844,7 +914,7 @@ class NextcloudTalkClient:
                 "refused cross-origin authenticated request", category="security"
             )
         opener = request.build_opener(_SameOriginRedirectHandler(self._base_origin))
-        return opener.open(req, timeout=self.timeout)
+        return opener.open(req, timeout=self.timeout if timeout is None else timeout)
 
     @staticmethod
     def _read_bounded(stream: Any, limit: int) -> bytes:
@@ -944,6 +1014,7 @@ class NextcloudTalkClient:
             "timeout": timeout,
             "lastKnownMessageId": last_known_id,
             "limit": limit,
+            "setReadMarker": 0 if getattr(self, "explicit_read_marker", False) else None,
         }
         result = await asyncio.to_thread(
             self._request, "GET", room_token, query=query, expected_types=(list,)
@@ -1017,12 +1088,16 @@ class NextcloudTalkClient:
     async def send_message(self, room_token: str, message: str, *, reply_to: Optional[str] = None,
                            reference_id: Optional[str] = None,
                            thread_id: Optional[int] = None,
-                           thread_title: Optional[str] = None) -> Any:
+                           thread_title: Optional[str] = None,
+                           silent: bool = False) -> Any:
         data = {"message": message}
         if reference_id:
             data["referenceId"] = reference_id
         if reply_to:
             data["replyTo"] = reply_to
+        if silent:
+            # Talk posts the message without notifying the participants.
+            data["silent"] = "true"
         if thread_id is not None:
             data["threadId"] = str(int(thread_id))
         elif thread_title:
@@ -1062,6 +1137,106 @@ class NextcloudTalkClient:
         spreed = (data.get("capabilities") or {}).get("spreed") if isinstance(data, dict) else None
         features = spreed.get("features") if isinstance(spreed, dict) else None
         return isinstance(features, list) and "threads" in features
+
+    def _ocs_form_sync(self, method: str, endpoint: str, data: Dict[str, Any]) -> Any:
+        """Authenticated form request to an OCS endpoint; 4xx raise with the status code."""
+        body = parse.urlencode(data).encode("utf-8")
+        headers = dict(self._headers)
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+        req = request.Request(f"{self.base_url}{endpoint}", data=body, headers=headers, method=method)
+        try:
+            with self._open_authenticated(req, timeout=_PRESENTATION_HTTP_TIMEOUT) as resp:
+                parsed = self._read_json(resp)
+        except error.HTTPError as exc:
+            self._read_bounded(exc, _MAX_ERROR_BYTES)
+            raise NextcloudTalkAPIError(f"HTTP {exc.code}", status_code=exc.code) from exc
+        except (error.URLError, TimeoutError, OSError) as exc:
+            raise _network_api_error() from exc
+        return self._ocs_data(parsed)
+
+    _PRESENTATION_INIT_LOCK = threading.Lock()
+
+    def _presentation_lock(self) -> Any:
+        """The pool guard; created lazily for wrappers that skip ``__init__``."""
+        guard = getattr(self, "_presentation_guard", None)
+        if guard is None:
+            with NextcloudTalkClient._PRESENTATION_INIT_LOCK:
+                guard = getattr(self, "_presentation_guard", None)
+                if guard is None:
+                    guard = self._presentation_guard = threading.Lock()
+                    self._presentation_pool = None
+                    self._presentation_pending = 0
+        return guard
+
+    async def _presentation_call(self, method: str, endpoint: str, data: Dict[str, Any]) -> Any:
+        """Run a best-effort presentation request on the dedicated small pool.
+
+        A full queue refuses the call instead of waiting, so a stalled server
+        costs at most ``_PRESENTATION_WORKERS`` threads and never delays polls
+        or sends on the default executor.
+        """
+        guard = self._presentation_lock()
+        with guard:
+            if self._presentation_pending >= _PRESENTATION_MAX_PENDING:
+                raise NextcloudTalkAPIError("presentation queue full", category="overflow")
+            if self._presentation_pool is None:
+                self._presentation_pool = concurrent.futures.ThreadPoolExecutor(
+                    max_workers=_PRESENTATION_WORKERS,
+                    thread_name_prefix="nextcloud-talk-presentation",
+                )
+            self._presentation_pending += 1
+            try:
+                future = self._presentation_pool.submit(
+                    self._ocs_form_sync, method, endpoint, data
+                )
+            except BaseException:
+                self._presentation_pending -= 1
+                raise
+
+        def _release(_future: Any) -> None:
+            with guard:
+                self._presentation_pending -= 1
+
+        future.add_done_callback(_release)
+        return await asyncio.wrap_future(future)
+
+    def close_presentation(self) -> None:
+        """Drop queued presentation calls; running ones end at their HTTP time-out."""
+        with self._presentation_lock():
+            pool = getattr(self, "_presentation_pool", None)
+            self._presentation_pool = None
+        if pool is not None:
+            pool.shutdown(wait=False, cancel_futures=True)
+
+    @staticmethod
+    def _spreed_endpoint(kind: str, room_token: str, suffix: str = "") -> str:
+        encoded_token = parse.quote(str(room_token).strip("/"), safe="")
+        return f"/ocs/v2.php/apps/spreed/api/v1/{kind}/{encoded_token}{suffix}"
+
+    async def add_reaction(self, room_token: str, message_id: int, reaction: str) -> None:
+        await self._presentation_call(
+            "POST",
+            self._spreed_endpoint("reaction", room_token, f"/{int(message_id)}"),
+            {"reaction": reaction},
+        )
+
+    async def remove_reaction(self, room_token: str, message_id: int, reaction: str) -> None:
+        try:
+            await self._presentation_call(
+                "DELETE",
+                self._spreed_endpoint("reaction", room_token, f"/{int(message_id)}"),
+                {"reaction": reaction},
+            )
+        except NextcloudTalkAPIError as exc:
+            if exc.status_code != 404:  # 404: the reaction is already gone
+                raise
+
+    async def mark_read(self, room_token: str, message_id: int) -> None:
+        await self._presentation_call(
+            "POST",
+            self._spreed_endpoint("chat", room_token, "/read"),
+            {"lastReadMessage": int(message_id)},
+        )
 
     def _dav_url(self, remote_path: str) -> str:
         if not isinstance(remote_path, str) or not remote_path or len(remote_path) > _MAX_DAV_PATH_LENGTH:
@@ -1627,7 +1802,9 @@ class NextcloudTalkClient:
     def _share_file_to_talk_sync(self, remote_path: str, room_token: str, *,
                                  caption: Optional[str] = None,
                                  reply_to: Optional[str] = None,
-                                 thread_id: Optional[int] = None) -> Any:
+                                 thread_id: Optional[int] = None,
+                                 message_type: Optional[str] = None,
+                                 silent: bool = False) -> Any:
         form: Dict[str, Any] = {
             "path": remote_path, "shareType": 10, "shareWith": room_token
         }
@@ -1638,6 +1815,12 @@ class NextcloudTalkClient:
             talk_metadata["replyTo"] = _sanitize_reply_field(reply_to, 64)
         if thread_id is not None:
             talk_metadata["threadId"] = int(thread_id)
+        if message_type in _TALK_SHARE_MESSAGE_TYPES:
+            talk_metadata["messageType"] = message_type
+        if silent:
+            # Talk posts the share without chat notifications (needs the
+            # ``media-caption`` capability; older servers ignore the field).
+            talk_metadata["silent"] = True
         if talk_metadata:
             form["talkMetaData"] = json.dumps(
                 talk_metadata, sort_keys=True, separators=(",", ":")
@@ -1655,14 +1838,18 @@ class NextcloudTalkClient:
     async def upload_and_share_file(self, local_path: str, room_token: str,
                                     upload_folder: str, *, caption: Optional[str] = None,
                                     reply_to: Optional[str] = None,
-                                    thread_id: Optional[int] = None) -> tuple[str, Any, bool, bool]:
+                                    thread_id: Optional[int] = None,
+                                    message_type: Optional[str] = None,
+                                    silent: bool = False) -> tuple[str, Any, bool, bool]:
         remote_path = await asyncio.to_thread(self._upload_file_sync, local_path, upload_folder)
         try:
-            if caption or reply_to or thread_id is not None:
+            if caption or reply_to or thread_id is not None or message_type or silent:
                 share = await asyncio.to_thread(
                     self._share_file_to_talk_sync, remote_path, room_token,
                     caption=caption, reply_to=reply_to,
                     **({"thread_id": thread_id} if thread_id is not None else {}),
+                    **({"message_type": message_type} if message_type else {}),
+                    **({"silent": True} if silent else {}),
                 )
             else:
                 share = await asyncio.to_thread(
@@ -1670,7 +1857,9 @@ class NextcloudTalkClient:
                 )
             return remote_path, share, True, True
         except NextcloudTalkAPIError as exc:
-            if (caption or reply_to or thread_id is not None) and exc.category == "capability":
+            if (
+                caption or reply_to or thread_id is not None or message_type or silent
+            ) and exc.category == "capability":
                 # A structured capability response is the only safe proof that
                 # this server cannot attach Talk metadata atomically.
                 share = await asyncio.to_thread(
@@ -1691,6 +1880,11 @@ class NextcloudTalkClient:
 class NextcloudTalkAdapter(BasePlatformAdapter):
     MAX_MESSAGE_LENGTH = _DEFAULT_MAX_MESSAGE_LENGTH
     splits_long_messages = True
+    # Processing status as reactions on the user's message (Base swaps the
+    # in-progress reaction for the outcome one in on_processing_complete).
+    _ACK_EMOJI = "👀"
+    _OK_EMOJI = "✅"
+    _FAIL_EMOJI = "❌"
 
     _DETERMINISTIC_ATTACHMENT_CATEGORIES = {
         "security", "path", "overflow", "aggregate_overflow", "content", "shape", "protocol"
@@ -1708,6 +1902,27 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self.require_mention = _truthy(
             _cfg(extra, "NEXTCLOUD_TALK_REQUIRE_MENTION", "require_mention", None), False
         )
+        self.markdown = _truthy(_cfg(extra, "NEXTCLOUD_TALK_MARKDOWN", "markdown", None), True)
+        self.status_reactions = _reaction_mode(
+            _cfg(extra, "NEXTCLOUD_TALK_REACTIONS", "reactions", None)
+        )
+        self.read_marker = _truthy(
+            _cfg(extra, "NEXTCLOUD_TALK_READ_MARKER", "read_marker", None), True
+        )
+        notifications = str(
+            _cfg(extra, "NEXTCLOUD_TALK_NOTIFICATIONS", "notifications", None) or "important"
+        ).strip().lower()
+        if notifications not in _NOTIFICATION_MODES:
+            logger.warning(
+                "[nextcloud_talk] Unknown notifications mode %r; using 'important' (valid: all, important)",
+                _safe_log_text(notifications, 32),
+            )
+            notifications = "important"
+        self.notifications = notifications
+        self._read_marker_pending: Dict[str, int] = {}
+        self._read_marker_done: Dict[str, int] = {}
+        self._read_marker_tasks: Dict[str, asyncio.Task] = {}
+        self._presentation_tasks: Set[asyncio.Task] = set()
         # Legacy PROCESS_HISTORY=true means unlimited first-run backfill.  The
         # safe default is a documented bounded backlog, never "skip to latest".
         self.process_history = _truthy(
@@ -1965,6 +2180,136 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         else:
             self._busy_session_handler = tracked
 
+    def _reactions_enabled(self) -> bool:
+        return getattr(self, "status_reactions", "off") in {"all", "groups"} and self._client is not None
+
+    def _reactions_enabled_for(self, chat_id: str) -> bool:
+        if not self._reactions_enabled():
+            return False
+        if getattr(self, "status_reactions", "off") == "groups":
+            return getattr(self, "_room_types", {}).get(chat_id) not in {None, 1}
+        return True
+
+    async def _status_reaction(self, action: str, chat_id: Any, message_id: Any,
+                               emoji: Optional[str]) -> None:
+        """Best-effort, bounded reaction call that can never affect delivery or ACKs."""
+        numeric_id = _strict_talk_message_id(
+            int(message_id) if isinstance(message_id, str) and message_id.isascii()
+            and message_id.isdigit() and len(message_id) <= 19 else message_id
+        )
+        client = self._client
+        if (
+            client is None or numeric_id is None
+            or not isinstance(chat_id, str) or not chat_id or not emoji
+            or not self._reactions_enabled_for(chat_id)
+        ):
+            return
+        call = getattr(client, "add_reaction" if action == "add" else "remove_reaction", None)
+        if not callable(call):
+            return
+        try:
+            await asyncio.wait_for(call(chat_id, numeric_id, emoji), _STATUS_REACTION_TIMEOUT)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug(
+                "[nextcloud_talk] Status reaction %s failed in room %s: %s",
+                action, self._safe_room_token(chat_id), _safe_outward_error_text(exc),
+            )
+
+    async def _add_reaction(self, chat_id: str, message_id: str, emoji: str) -> None:
+        await self._status_reaction("add", chat_id, message_id, emoji)
+
+    async def _remove_reaction(self, chat_id: str, message_id: str) -> None:
+        await self._status_reaction("remove", chat_id, message_id, self._ACK_EMOJI)
+
+    def _spawn_presentation(self, coro: Any) -> asyncio.Task:
+        """Detached presentation task: never awaited by a turn, cancelled on disconnect.
+
+        Kept out of Base's ``_background_tasks`` so it can never be mistaken
+        for a deferred handler of the message being dispatched.
+        """
+        tasks = getattr(self, "_presentation_tasks", None)
+        if tasks is None:
+            tasks = self._presentation_tasks = set()
+        task = asyncio.create_task(coro)
+        tasks.add(task)
+        task.add_done_callback(tasks.discard)
+        return task
+
+    async def on_processing_start(self, event: MessageEvent) -> None:
+        await super().on_processing_start(event)
+        metadata = getattr(event, "metadata", None)
+        if not isinstance(metadata, dict) or metadata.get("nextcloud_talk_message_id") is None:
+            return  # only real Talk messages get a status reaction
+        chat_id = getattr(event.source, "chat_id", None)
+        if not isinstance(chat_id, str) or not self._reactions_enabled_for(chat_id):
+            return
+        # Never awaited here: Base runs this hook before the handler, so an
+        # awaited slow reaction would delay the reply itself.
+        metadata["nextcloud_talk_reaction_task"] = self._spawn_presentation(
+            self._add_reaction(chat_id, getattr(event, "message_id", None), self._ACK_EMOJI)
+        )
+
+    async def _swap_status_reaction(self, base_hook: Any, event: MessageEvent,
+                                    outcome: ProcessingOutcome,
+                                    start_task: Optional[asyncio.Task]) -> None:
+        """Replace 👀 with the outcome reaction once the 👀 call has finished."""
+        if start_task is not None and not start_task.done():
+            # The add call is bounded by its own guard; waiting for it keeps
+            # the later remove from overtaking it on the server.
+            await asyncio.wait({start_task}, timeout=_STATUS_REACTION_TIMEOUT + 1.0)
+        try:
+            await base_hook(event, outcome)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:
+            logger.debug("[nextcloud_talk] Status reaction swap failed: %s",
+                         _safe_outward_error_text(exc))
+
+    def _queue_read_marker(self, room_token: str, message_id: int) -> None:
+        """Mark the room read up to ``message_id`` in the background (monotonic, best effort)."""
+        if not getattr(self, "read_marker", False) or self._client is None:
+            return
+        pending = self._read_marker_pending
+        done = self._read_marker_done
+        if message_id <= max(pending.get(room_token, 0), done.get(room_token, 0)):
+            return
+        pending[room_token] = message_id
+        task = self._read_marker_tasks.get(room_token)
+        if task is None or task.done():
+            self._read_marker_tasks[room_token] = asyncio.create_task(
+                self._flush_read_marker(room_token)
+            )
+
+    async def _flush_read_marker(self, room_token: str) -> None:
+        pending = self._read_marker_pending
+        done = self._read_marker_done
+        while True:
+            target = pending.get(room_token)
+            client = self._client
+            if target is None or client is None or target <= done.get(room_token, 0):
+                pending.pop(room_token, None)
+                return
+            try:
+                mark_read = getattr(client, "mark_read", None)
+                if not callable(mark_read):
+                    pending.pop(room_token, None)
+                    return
+                await asyncio.wait_for(mark_read(room_token, target), _READ_MARKER_TIMEOUT)
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.debug(
+                    "[nextcloud_talk] Read marker failed in room %s: %s",
+                    self._safe_room_token(room_token), _safe_outward_error_text(exc),
+                )
+                if pending.get(room_token) == target:
+                    pending.pop(room_token, None)
+                    return
+                continue  # a newer message arrived meanwhile: try that one
+            done[room_token] = max(done.get(room_token, 0), target)
+
     async def _send_with_retry(self, *args, **kwargs) -> SendResult:
         """Capture Base's real inline delivery result for the active generation."""
         self._ensure_ack_runtime()
@@ -2065,6 +2410,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             max_cache_bytes=self.max_cache_bytes,
             max_cache_files=self.max_cache_files,
         )
+        self._client.explicit_read_marker = bool(self.read_marker)
 
         if len(self.room_tokens) > self.max_rooms:
             self._set_fatal_error(
@@ -2121,6 +2467,22 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             topics_task.cancel()
             await asyncio.gather(topics_task, return_exceptions=True)
         self._topics_task = None
+        read_tasks = list(getattr(self, "_read_marker_tasks", {}).values())
+        for task in read_tasks:
+            task.cancel()
+        if read_tasks:
+            await asyncio.gather(*read_tasks, return_exceptions=True)
+        getattr(self, "_read_marker_tasks", {}).clear()
+        getattr(self, "_read_marker_pending", {}).clear()
+        presentation_tasks = list(getattr(self, "_presentation_tasks", set()))
+        for task in presentation_tasks:
+            task.cancel()
+        if presentation_tasks:
+            await asyncio.gather(*presentation_tasks, return_exceptions=True)
+        getattr(self, "_presentation_tasks", set()).clear()
+        close_presentation = getattr(self._client, "close_presentation", None)
+        if callable(close_presentation):
+            close_presentation()
         initialization_tasks = list(getattr(self, "_initialization_tasks", {}).values())
         for task in initialization_tasks:
             task.cancel()
@@ -2897,7 +3259,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     def _drop_volatile_room_state(self, room_token: str) -> None:
         for name in ("_room_seen_ids", "_scan_resume", "_dispatch_attempts",
-                     "_retry_not_before", "_poll_page_limits", "_sweep_completed_from"):
+                     "_retry_not_before", "_poll_page_limits", "_sweep_completed_from",
+                     "_read_marker_done", "_read_marker_pending"):
             getattr(self, name, {}).pop(room_token, None)
 
     def _retry_deferred(self, room_token: str, numeric_id: int) -> bool:
@@ -4000,6 +4363,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             },
             **reply_fields,
         )
+        if numeric_id is not None:
+            # Show the sender that the bot has picked the message up.
+            self._queue_read_marker(room_token, numeric_id)
         topic = self._topic_for_thread(room_token, thread_id)
         if topic is not None:
             if topic.get("skills") and hasattr(event, "auto_skill"):
@@ -4098,7 +4464,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         completion_event = metadata.get("nextcloud_talk_completion_event")
         if isinstance(completion_event, asyncio.Event):
             completion_event.set()
-        await super().on_processing_complete(event, effective_outcome)
+        start_task = metadata.pop("nextcloud_talk_reaction_task", None)
+        chat_id = getattr(getattr(event, "source", None), "chat_id", None)
+        if isinstance(chat_id, str) and self._reactions_enabled_for(chat_id):
+            # The swap is presentation only: run it detached so the queued
+            # follow-up, typing stop and post-delivery callback are not held
+            # behind two reaction round-trips.
+            self._spawn_presentation(self._swap_status_reaction(
+                super().on_processing_complete, event, effective_outcome,
+                start_task if isinstance(start_task, asyncio.Task) else None,
+            ))
+        else:
+            await super().on_processing_complete(event, effective_outcome)
         if hook_error is not None:
             raise hook_error
 
@@ -4151,21 +4528,26 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         target_room = chat_id or (self.room_tokens[0] if self.room_tokens else "")
         if not target_room:
             return SendResult(success=False, error="No room token configured")
-        chunks = self._split_message(_strip_rich_text(content))
+        chunks = self._split_message(
+            _talk_text(content, markdown=getattr(self, "markdown", True))
+        )
         message_ids: List[str] = []
         thread_id = _outbound_thread_id(metadata)
+        silent_kwargs = {"silent": True} if self._send_silently(metadata) else {}
         try:
             for chunk in chunks:
                 reference_id = str(uuid.uuid4())
                 if thread_id is None:
                     result = await self._client.send_message(
-                        target_room, chunk, reply_to=reply_to, reference_id=reference_id
+                        target_room, chunk, reply_to=reply_to, reference_id=reference_id,
+                        **silent_kwargs,
                     )
                 else:
                     try:
                         result = await self._client.send_message(
                             target_room, chunk, reply_to=reply_to,
                             reference_id=reference_id, thread_id=thread_id,
+                            **silent_kwargs,
                         )
                     except NextcloudTalkAPIError as exc:
                         if exc.status_code != 400:
@@ -4184,6 +4566,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         reply_to = None
                         result = await self._client.send_message(
                             target_room, chunk, reference_id=str(uuid.uuid4()),
+                            **silent_kwargs,
                         )
                 talk_id = _strict_talk_message_id(
                     result.get("id") if isinstance(result, dict) else None
@@ -4225,20 +4608,63 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 raw_response={"partial_delivery": bool(message_ids), "delivered_message_ids": message_ids},
             )
 
+    def _send_silently(self, metadata: Any) -> bool:
+        """In ``important`` mode only final replies and prompts notify.
+
+        Hermes marks a final reply with ``metadata["notify"]`` (cron delivery
+        and background-task notices too) and approval/clarify prompts with
+        ``is_approval_prompt``; progress, status and tool messages carry
+        neither and are posted silently, like Telegram's default mode.
+        """
+        if getattr(self, "notifications", "all") != "important":
+            return False
+        if isinstance(metadata, dict) and (
+            metadata.get("notify") or metadata.get("is_approval_prompt")
+        ):
+            return False
+        return True
+
     def _split_message(self, content: str) -> List[str]:
+        """Split at line/word boundaries without breaking Markdown code fences.
+
+        A chunk that ends inside a ``` fence is closed and the next chunk
+        reopens it with the same info string, so every chunk renders on its
+        own; indentation at chunk edges is preserved.
+        """
         content = content or ""
-        if len(content) <= self.max_message_length:
+        limit = max(1, int(self.max_message_length))
+        if len(content) <= limit:
             return [content]
+        closer = "\n```"
+        # Fence repair needs room for an opener, a closer and some content.
+        repair = limit >= 128
         chunks: List[str] = []
         remaining = content
+        reopen = ""
         while remaining:
-            chunk = remaining[: self.max_message_length]
-            split_at = max(chunk.rfind("\n"), chunk.rfind(" "))
-            if split_at > self.max_message_length // 3:
-                chunk = remaining[:split_at]
-            chunks.append(chunk.strip())
-            remaining = remaining[len(chunk):].lstrip()
-        return chunks or [""]
+            if len(reopen) + len(remaining) <= limit:
+                chunks.append(reopen + remaining)
+                break
+            budget = limit - len(reopen) - (len(closer) if repair else 0)
+            piece = remaining[:budget]
+            split_at = piece.rfind("\n")
+            if split_at <= budget // 3:
+                split_at = max(split_at, piece.rfind(" "))
+            if split_at > budget // 3:
+                piece = remaining[:split_at]
+                remaining = remaining[split_at + 1:]  # drop exactly the separator
+            else:
+                remaining = remaining[len(piece):]
+            body = reopen + piece
+            opener = _open_code_fence(body) if repair else None
+            if opener is not None:
+                chunks.append(body.rstrip("\n") + closer)
+                # Keep the reopened info string short enough for the budget.
+                reopen = opener[: max(3, limit // 4)] + "\n"
+            else:
+                chunks.append(body.rstrip())
+                reopen = ""
+        return [chunk for chunk in chunks if chunk.strip()] or [""]
 
     async def send_typing(self, chat_id: str, metadata: Optional[Dict[str, Any]] = None) -> None:
         return None
@@ -4262,10 +4688,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        message_type: Optional[str] = None,
     ) -> SendResult:
-        thread_kwargs = (
-            {"metadata": metadata} if _outbound_thread_id(metadata) is not None else {}
-        )
+        # Always forward the metadata: besides the thread it carries ``notify``,
+        # which decides whether a caption/link follow-up is posted silently.
+        thread_kwargs: Dict[str, Any] = {"metadata": metadata} if metadata else {}
+        if message_type:
+            thread_kwargs["message_type"] = message_type
         try:
             result = await self._send_file_attachment(
                 chat_id, local_path, caption=caption, reply_to=reply_to, **thread_kwargs
@@ -4278,7 +4707,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def _send_file_attachment(self, chat_id: str, local_path: str, caption: Optional[str] = None,
                                     reply_to: Optional[str] = None,
-                                    metadata: Optional[Dict[str, Any]] = None) -> SendResult:
+                                    metadata: Optional[Dict[str, Any]] = None,
+                                    message_type: Optional[str] = None) -> SendResult:
         if not self._client:
             return SendResult(success=False, error="Not connected")
         path = Path(str(local_path)).expanduser()
@@ -4302,6 +4732,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 str(path), target_room, self.upload_folder,
                 caption=caption, reply_to=reply_to,
                 **({"thread_id": thread_id} if thread_id is not None else {}),
+                **({"message_type": message_type} if message_type else {}),
+                **({"silent": True} if self._send_silently(metadata) else {}),
             )
             if len(upload_result) == 4:
                 remote_path, share, native_talk_share, atomic_metadata = upload_result
@@ -4450,10 +4882,22 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def send_voice(self, chat_id: str, audio_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, **kwargs) -> SendResult:
+        # A voice reply (TTS, ``[[audio_as_voice]]``) becomes a Talk voice
+        # message with an inline player; Talk accepts that only for MP3/WAV.
+        voice = (
+            kwargs.get("is_voice") is True
+            and Path(str(audio_path or "")).suffix.lower() in _VOICE_MESSAGE_SUFFIXES
+        )
         return await self._send_tracked_media_attachment(
             chat_id, audio_path, caption=caption, reply_to=reply_to,
             metadata=kwargs.get("metadata"),
+            **({"message_type": "voice-message"} if voice else {}),
         )
+
+    async def play_tts(self, chat_id: str, audio_path: str, **kwargs) -> SendResult:
+        """Auto-TTS replies are voice replies: share MP3/WAV as Talk voice messages."""
+        kwargs.setdefault("is_voice", True)
+        return await self.send_voice(chat_id=chat_id, audio_path=audio_path, **kwargs)
 
     async def send_video(self, chat_id: str, video_path: str, caption: Optional[str] = None,
                          reply_to: Optional[str] = None, **kwargs) -> SendResult:
@@ -4591,7 +5035,8 @@ def register(ctx) -> None:
         emoji="☁️",
         allow_update_command=True,
         platform_hint=(
-            "You are chatting via Nextcloud Talk (multi-room). Plain text and simple links work best. "
-            "Avoid complex markdown tables. Keep responses concise in busy group rooms."
+            "You are chatting via Nextcloud Talk (multi-room). Talk renders Markdown: bold, lists, "
+            "code blocks, links and simple tables work; images are shown as link previews. "
+            "Keep responses concise in busy group rooms."
         ),
     )

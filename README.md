@@ -18,6 +18,8 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Inbound images, audio, and documents downloaded to the Hermes media pipeline.
 - Captioned attachments work even when Talk does not include a `{file}` placeholder.
 - Native outbound image/document sharing through WebDAV and Nextcloud Talk shares.
+- Talk-native presentation: Markdown replies, processing-status reactions (👀 → ✅/❌), read
+  markers, silent progress messages, and TTS replies as Talk voice messages.
 - Optional public-link fallback (disabled by default) if native Talk sharing is unavailable.
 - Python standard library only at runtime.
 
@@ -174,6 +176,10 @@ NEXTCLOUD_TALK_MAX_DISPATCH_ATTEMPTS=5
 NEXTCLOUD_TALK_MAX_DELIVERY_ATTEMPTS=8
 NEXTCLOUD_TALK_PROCESSING_TIMEOUT=300
 NEXTCLOUD_TALK_ALLOW_PUBLIC_SHARE_FALLBACK=false
+NEXTCLOUD_TALK_MARKDOWN=true
+NEXTCLOUD_TALK_REACTIONS=groups
+NEXTCLOUD_TALK_READ_MARKER=true
+NEXTCLOUD_TALK_NOTIFICATIONS=important
 ```
 
 HTTPS is required for non-loopback `NEXTCLOUD_TALK_URL` values. Plain HTTP is
@@ -253,6 +259,33 @@ are retained and malformed entries are ignored. A payload that declares an unsup
 version or otherwise has an envelope shape is preserved byte-for-byte, persistence is
 blocked, and no envelope field is reinterpreted as a room. Recover such a file only
 after upgrading to a compatible plugin or explicitly moving it aside.
+
+### Talk presentation
+
+- **Markdown** (`markdown`, default `true`). Talk renders chat messages as Markdown (code
+  blocks, links, lists, tables), so replies are sent as written; only image embeds become their
+  URL, which Talk shows as a link preview. `false` restores the older plain-text conversion.
+- **Status reactions** (`reactions`, default `groups`). The bot reacts 👀 to a message when it
+  starts working on it and swaps that for ✅ or ❌ when the turn ends. Talk notifies a message's
+  author about every reaction in one-to-one rooms, so the default limits this to group rooms
+  (where Talk notifies about reactions only at the "all messages" level). `all` adds one-to-one
+  rooms, `off` disables it. Reactions run detached from the turn on a small dedicated thread
+  pool (short HTTP time-out, bounded queue): a failed or slow reaction never delays or changes
+  the reply or its acknowledgement. A turn released by the processing time-out and not retried
+  can keep its 👀.
+- **Read marker** (`read_marker`, default `true`). The bot marks the room read up to each
+  message it accepts, so the sender sees it was picked up, and polls ask Talk not to move the
+  marker on their own. Best effort and monotonic. `false` leaves the marker to Talk, which
+  advances it on every poll.
+- **Notifications** (`notifications`, default `important`). Only final replies, approval and
+  clarify prompts, cron deliveries and background-task notices notify; progress, status and
+  tool messages are posted silently (Talk `silent` send), like Hermes' Telegram default. A plain
+  agent `send_message` to Talk is silent too, and so is the turn-error notice. The caption or
+  link message of a final attachment notifies with it; file shares follow the same rule (Talk
+  `silent` share metadata, `media-caption` capability). `all` notifies for every message.
+- **Voice messages.** A voice reply (auto-TTS or `[[audio_as_voice]]`) in MP3 or WAV is shared as a Talk voice
+  message with an inline player. Talk keeps that type only for those two formats; other audio
+  is shared as an ordinary file.
 
 ### Threads and topics
 
@@ -428,7 +461,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.14 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.15 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

@@ -64,6 +64,7 @@ import threading
 import time
 import unicodedata
 import uuid
+import weakref
 from contextvars import ContextVar
 from datetime import datetime
 from pathlib import Path
@@ -158,7 +159,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.16"
+_RELEASED_VERSION = "0.1.17"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -185,6 +186,14 @@ def _plugin_version() -> str:
 _PLUGIN_VERSION = _plugin_version()
 
 _DEFAULT_POLL_TIMEOUT = 30
+# While a turn runs, the room is still long-polled so slash commands for the
+# busy session (/approve, /deny, /stop) reach Hermes immediately.  Held
+# follow-ups are dispatched when the turn ends, so keep this wait short: it
+# bounds the extra delay before they are picked up.
+_INFLIGHT_POLL_TIMEOUT = 5
+_INFLIGHT_MAX_PAGES = 32
+# In-memory guard for commands core ran whose durable ACK failed.
+_SETTLED_COMMAND_LIMIT = 1024
 _DEFAULT_MAX_MESSAGE_LENGTH = 32000
 _DEFAULT_MAX_DOWNLOAD_BYTES = 25 * 1024 * 1024
 _DEFAULT_MAX_UPLOAD_BYTES = 25 * 1024 * 1024
@@ -2850,6 +2859,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._current_generations = {}
         if not hasattr(self, "_inflight_generations"):
             self._inflight_generations = {}
+        if not hasattr(self, "_live_anchors"):
+            # Newest Talk ID observed per room: the in-flight command poll
+            # reads only messages after it instead of re-sweeping the floor.
+            self._live_anchors = {}
+        if not hasattr(self, "_user_stop_sessions"):
+            # Sessions whose /stop, /new or /reset is being dispatched inline.
+            self._user_stop_sessions = set()
+        if not hasattr(self, "_settled_commands"):
+            # Inline commands core already handled whose durable ACK failed:
+            # never hand them to core again in this process (bounded).
+            self._settled_commands = collections.OrderedDict()
+        if not hasattr(self, "_user_stopped_tasks"):
+            # Turn tasks that Hermes core cancelled for such a command.
+            self._user_stopped_tasks = weakref.WeakSet()
         if not hasattr(self, "_generation_outcomes"):
             self._generation_outcomes = {}
         if not hasattr(self, "_dispatch_generation_context"):
@@ -3711,10 +3734,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         assert self._client is not None
         try:
             self._ensure_ack_runtime()
-            if (
-                self._inflight_message_ids.get(room_token)
-                and not self._room_has_pending_clarify(room_token)
-            ):
+            room_inflight = bool(self._inflight_message_ids.get(room_token))
+            if room_inflight and not self._room_has_pending_clarify(room_token):
+                if self._room_has_busy_session(room_token):
+                    await self._poll_inflight_commands(room_token)
                 return
             max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
             poll_anchor = self._poll_anchor(room_token)
@@ -3857,7 +3880,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 # for genuinely new messages from the newest ID seen, so an idle
                 # room waits instead of rescanning.
                 messages = await fetch(highest_seen, self.poll_timeout)
-                normalized, malformed, _ = normalize_batch(messages)
+                normalized, malformed, live_ids = normalize_batch(messages)
+                if live_ids:
+                    highest_seen = max([highest_seen or 0, *live_ids])
                 malformed_total += malformed
                 await dispatch(normalized)
             if malformed_total:
@@ -3865,6 +3890,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     "[nextcloud_talk] Ignored %d poll message(s) with malformed/missing IDs in room %s",
                     malformed_total, self._safe_room_token(room_token),
                 )
+            if highest_seen is not None:
+                self._note_live_anchor(room_token, highest_seen)
             self._settle_room_floor(room_token)
             if pages > 1 or len(messages) > 5:
                 await asyncio.sleep(0.5)
@@ -3907,6 +3934,209 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             and self._source_has_pending_clarify(getattr(event, "source", None))
             for key, event in self._inflight_generations.items()
         )
+
+    def _note_live_anchor(self, room_token: str, message_id: Any) -> None:
+        numeric = _strict_talk_message_id(message_id)
+        if numeric is None:
+            return
+        anchors = self._live_anchors
+        if numeric > anchors.get(room_token, 0):
+            anchors[room_token] = numeric
+
+    async def _poll_inflight_commands(self, room_token: str) -> None:
+        """Read new room messages during a running turn; pass only commands.
+
+        Hermes core expects ``/approve``, ``/deny``, ``/stop`` and the other
+        slash commands to reach a busy session at once.  This poll reads only
+        messages after the newest ID already observed (no floor re-sweep), and
+        hands a message to the normal intake only when it is a slash command
+        the turn's owner may send now.  Every other message is left untouched
+        (no ACK, no download): the normal sweep handles it after the turn.
+        """
+        assert self._client is not None
+        anchor = self._live_anchors.get(room_token)
+        inflight_ids = self._inflight_message_ids.get(room_token) or set()
+        if inflight_ids:
+            anchor = max([anchor or 0, *inflight_ids])
+        if anchor is None:
+            return
+        max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
+        timeout = min(self.poll_timeout, _INFLIGHT_POLL_TIMEOUT)
+        # Bounded catch-up: a burst of other posts must not keep the owner's
+        # command many cycles away. Later pages do not wait.
+        for _page in range(_INFLIGHT_MAX_PAGES):
+            page, limit = await self._fetch_inflight_page(
+                room_token, anchor, timeout, max_batch
+            )
+            timeout = 0
+            highest = await self._dispatch_inflight_page(room_token, anchor, page)
+            if highest is None or highest <= anchor or len(page) < limit:
+                return
+            anchor = highest
+
+    async def _fetch_inflight_page(
+        self, room_token: str, anchor: int, timeout: int, max_batch: int
+    ) -> tuple:
+        """One in-flight page; an oversized page is retried smaller (as the sweep does)."""
+        limit = min(self._poll_page_limits.get(room_token, max_batch), max_batch)
+        while True:
+            try:
+                page = await self._client.get_messages(
+                    room_token, last_known_id=anchor, look_into_future=True,
+                    timeout=timeout, limit=limit,
+                )
+            except NextcloudTalkAPIError as exc:
+                if exc.category != "overflow" or limit <= 1:
+                    raise
+                limit = max(1, limit // 2)
+                self._poll_page_limits[room_token] = limit
+                logger.warning(
+                    "[nextcloud_talk] Poll page too large in room %s; retrying with %d messages",
+                    self._safe_room_token(room_token), limit,
+                )
+                continue
+            if not isinstance(page, list):
+                raise NextcloudTalkAPIError("chat response data is not a list", category="protocol")
+            if len(page) > max_batch:
+                raise NextcloudTalkAPIError("chat response exceeds poll batch limit", category="overflow")
+            if limit < max_batch and len(page) < limit:
+                # Past the large messages: recover the normal page size.
+                self._poll_page_limits.pop(room_token, None)
+            return page, limit
+
+    async def _dispatch_inflight_page(
+        self, room_token: str, anchor: int, page: List[Any]
+    ) -> Optional[int]:
+        """Pass this page's busy-session commands to intake; return its newest ID."""
+        highest: Optional[int] = None
+        candidates: Dict[int, dict] = {}
+        for msg in page:
+            if not isinstance(msg, dict):
+                continue
+            message_id = _strict_talk_message_id(msg.get("id"))
+            if message_id is None or message_id <= anchor:
+                continue
+            highest = message_id if highest is None else max(highest, message_id)
+            self._note_live_anchor(room_token, message_id)
+            if self._is_acknowledged(room_token, message_id):
+                continue
+            if self._inflight_command_candidate(msg, room_token, message_id):
+                candidates[message_id] = msg
+        for message_id in sorted(candidates):
+            try:
+                await self._handle_talk_message(candidates[message_id], room_token)
+            except asyncio.CancelledError:
+                raise
+            except _OutcomeAlreadyRecorded:
+                continue
+            except Exception as exc:
+                logger.warning(
+                    "[nextcloud_talk] Message %s in room %s failed before dispatch: %s",
+                    message_id, self._safe_room_token(room_token),
+                    _safe_outward_error_text(exc),
+                )
+                self._record_dispatch_failure(room_token, message_id)
+        return highest
+
+    def _inflight_command_candidate(
+        self, msg: Dict[str, Any], room_token: str, numeric_id: int
+    ) -> bool:
+        """Side-effect-free check: may this message pass the busy-room hold?"""
+        actor_id = msg.get("actorId")
+        if not isinstance(actor_id, str) or not actor_id.strip():
+            return False
+        actor_name = str(msg.get("actorDisplayName") or actor_id)
+        if str(msg.get("actorType") or "").lower() not in {"users", "guests"}:
+            return False
+        if msg.get("systemMessage"):
+            return False
+        username = self.username.lower()
+        if actor_id.lower() == username or actor_name.lower() == username:
+            return False
+        if self._is_own_presentation_event(msg):
+            return False
+        text = msg.get("message")
+        if not isinstance(text, str) or not text.strip():
+            return False
+        params = msg.get("messageParameters", {})
+        if params is None or params == []:
+            params = {}
+        if not isinstance(params, dict) or not _valid_message_parameters(params):
+            return False
+        chat_type = "dm" if self._room_types.get(room_token) == 1 else "group"
+        if not self._is_allowed(actor_id, actor_name, chat_type=chat_type):
+            return False
+        thread_fields: Dict[str, Any] = {}
+        thread_id = _inbound_thread_id(msg, numeric_id)
+        if thread_id is not None:
+            thread_fields["thread_id"] = str(thread_id)
+        source = self.build_source(
+            chat_id=room_token,
+            chat_name=f"Nextcloud Talk {self._safe_room_token(room_token)}",
+            chat_type=chat_type,
+            user_id=actor_id,
+            user_name=actor_name,
+            **thread_fields,
+        )
+        return self._room_lock_bypass_command(source, text.strip(), params) is not None
+
+    def _room_has_busy_session(self, room_token: str) -> bool:
+        """Return whether an in-flight event of this room holds the busy guard."""
+        active = getattr(self, "_active_sessions", {}) or {}
+        if not active:
+            return False
+        for key, event in list(self._inflight_generations.items()):
+            if key[0] != room_token:
+                continue
+            try:
+                session_key = self._source_session_key(getattr(event, "source", None))
+            except Exception:
+                continue
+            if session_key and session_key in active:
+                return True
+        return False
+
+    def _room_lock_bypass_command(
+        self, source: Any, text: str, file_refs: Dict[str, Any]
+    ) -> Optional[str]:
+        """Return the canonical slash command that may pass the room lock.
+
+        Mirrors Hermes core's busy-session rule (every recognized command is
+        dispatched mid-run, never queued) for the session that is actually
+        busy, and only for the participant who owns the running turn.  Messages
+        with attachments never pass, so no download happens for held input.
+        """
+        if source is None or not isinstance(text, str):
+            return None
+        if any(
+            isinstance(param, dict) and param.get("type") == "file"
+            for param in file_refs.values()
+        ):
+            return None
+        stripped = self._strip_bot_mention(text)
+        if not stripped or not stripped.startswith("/"):
+            return None
+        try:
+            from hermes_cli.commands import resolve_command, should_bypass_active_session
+        except Exception:
+            return None
+        try:
+            command = MessageEvent(text=stripped, source=source).get_command()
+        except Exception:
+            return None
+        if not command or not should_bypass_active_session(command):
+            return None
+        resolved = resolve_command(command)
+        canonical = getattr(resolved, "name", None) or command
+        try:
+            session_key = self._source_session_key(source)
+        except Exception:
+            return None
+        if not session_key or session_key not in (getattr(self, "_active_sessions", {}) or {}):
+            return None
+        if not self._source_matches_pending_participant(source, session_key):
+            return None
+        return canonical
 
     def _source_session_key(self, source: Any) -> Optional[str]:
         """Build the Hermes session key for one Talk message source."""
@@ -4115,6 +4345,108 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
         self._completion_watchdogs[key] = task
 
+    async def _dispatch_bypass_command(
+        self,
+        event: MessageEvent,
+        command: str,
+        room_token: str,
+        numeric_id: int,
+        generation: int,
+    ) -> None:
+        """Hand a busy-session slash command to core and settle it at most once.
+
+        Core runs such a command inline (``_handle_message_while_active``) and
+        reports neither success nor failure.  Commands are not idempotent
+        (``/queue``, ``/bg``, ``/approve`` of a later prompt), so an inline
+        command is acknowledged once core returns, whatever its outcome.  If the
+        turn ended meanwhile, core starts the command as a normal turn and the
+        usual completion lifecycle applies.
+        """
+        key = (room_token, numeric_id, generation)
+        session_key = None
+        owner_task = None
+        interrupts = False
+        try:
+            from hermes_cli.commands import is_interrupt_then_dispatch
+            interrupts = bool(is_interrupt_then_dispatch(command))
+        except Exception:
+            interrupts = False
+        if interrupts:
+            try:
+                session_key = self._source_session_key(event.source)
+            except Exception:
+                session_key = None
+            if session_key:
+                owner_task = (getattr(self, "_session_tasks", {}) or {}).get(session_key)
+                self._user_stop_sessions.add(session_key)
+        background_before = set(getattr(self, "_background_tasks", set()))
+        context_token = self._dispatch_generation_context.set(key)
+        dispatch_task = asyncio.current_task()
+        try:
+            await self.handle_message(event)
+        except BaseException:
+            metadata = getattr(event, "metadata", None) or {}
+            if metadata.get("nextcloud_talk_processing_task") is dispatch_task:
+                # Core already ran the command inline; never run it again.
+                self._remember_settled_command(room_token, numeric_id)
+            self._finish_without_ack(event, room_token, numeric_id, generation)
+            raise
+        finally:
+            self._dispatch_generation_context.reset(context_token)
+            if session_key:
+                self._user_stop_sessions.discard(session_key)
+                expected = getattr(self, "_expected_cancelled_tasks", None) or ()
+                if owner_task is not None and owner_task in expected:
+                    # Core really cancelled the turn for this command.
+                    self._user_stopped_tasks.add(owner_task)
+        metadata = getattr(event, "metadata", None) or {}
+        if metadata.get("nextcloud_talk_processing_task") is dispatch_task:
+            # Handled inline: settle exactly once, never replay the command.
+            if not self._generation_is_current(key):
+                return
+            self._generation_outcomes.get(key, {}).pop("media_delivery_failed", None)
+            metadata["nextcloud_talk_handler_state"] = "success"
+            metadata.pop("nextcloud_talk_text_delivery_required", None)
+            try:
+                await self.on_processing_complete(event, ProcessingOutcome.SUCCESS)
+            except Exception as exc:
+                self._remember_settled_command(room_token, numeric_id)
+                logger.warning(
+                    "[nextcloud_talk] Command %s in room %s ran but its ACK was not stored: %s",
+                    numeric_id, self._safe_room_token(room_token),
+                    _safe_outward_error_text(exc),
+                )
+                raise _OutcomeAlreadyRecorded("command settled in memory") from exc
+            if not self._is_acknowledged(room_token, numeric_id):
+                self._remember_settled_command(room_token, numeric_id)
+            return
+        await self._reconcile_base_dispatch(
+            event, room_token, numeric_id, generation, background_before
+        )
+
+    def _remember_settled_command(self, room_token: str, numeric_id: int) -> None:
+        settled = self._settled_commands
+        settled[(room_token, numeric_id)] = True
+        settled.move_to_end((room_token, numeric_id))
+        while len(settled) > _SETTLED_COMMAND_LIMIT:
+            settled.popitem(last=False)
+
+    def _is_user_stopped_turn(self, event: MessageEvent) -> bool:
+        """A CANCELLED turn that core cancelled for the user's /stop, /new or /reset."""
+        task = asyncio.current_task()
+        if task is None:
+            return False
+        if task in self._user_stopped_tasks:
+            return True
+        expected = getattr(self, "_expected_cancelled_tasks", None) or ()
+        if task not in expected:
+            return False
+        try:
+            session_key = self._source_session_key(getattr(event, "source", None))
+        except Exception:
+            return False
+        return bool(session_key) and session_key in self._user_stop_sessions
+
     async def _reconcile_base_dispatch(
         self,
         event: MessageEvent,
@@ -4241,6 +4573,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         inflight = self._inflight_message_ids.setdefault(room_token, set())
         if numeric_id in inflight:
             return
+        if (room_token, numeric_id) in self._settled_commands:
+            # Core already ran this command but its ACK was not stored: retry
+            # only the ACK, never the command.
+            try:
+                self._commit_cursor(room_token, numeric_id)
+            except Exception as exc:
+                logger.warning(
+                    "[nextcloud_talk] ACK retry for command %s in room %s failed: %s",
+                    numeric_id, self._safe_room_token(room_token),
+                    _safe_outward_error_text(exc),
+                )
+            else:
+                self._settled_commands.pop((room_token, numeric_id), None)
+            return
 
         raw_actor_id = msg.get("actorId")
         if not isinstance(raw_actor_id, str) or not raw_actor_id.strip():
@@ -4337,11 +4683,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         # Apply the exact-session room-lock exception before attachment I/O.
         # A message that cannot answer the unresolved clarify must remain on
         # Talk without triggering downloads or any other external work.
-        if inflight and not self._source_has_pending_clarify(
-            source, require_participant_owner=True
-        ):
-            return
-        await_completion = await_completion or bool(inflight)
+        bypass_command: Optional[str] = None
+        if inflight:
+            # A slash command for the busy session passes (core expects
+            # /approve, /deny, /stop mid-run, before any clarify intercept) and
+            # is settled at most once. Otherwise only a clarify answer passes;
+            # everything else waits on Talk.
+            bypass_command = self._room_lock_bypass_command(source, text, file_refs)
+            if bypass_command is None and not self._source_has_pending_clarify(
+                source, require_participant_owner=True
+            ):
+                return
+        # A bypass command is handled inline by core (or, if the turn just
+        # ended, as a normal turn); never block the poll waiting for it.
+        await_completion = await_completion or (bool(inflight) and bypass_command is None)
 
         if _is_unavailable_file_placeholder(text, file_refs):
             replacement = await self._refetch_unavailable_file(
@@ -4519,6 +4874,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._inflight_message_ids.setdefault(room_token, set()).add(numeric_id)
             self._inflight_generations[generation_key] = event
             self._generation_outcomes[generation_key] = {}
+        if bypass_command is not None and generation_key is not None:
+            await self._dispatch_bypass_command(
+                event, bypass_command, room_token, numeric_id, generation
+            )
+            return
         background_before = set(getattr(self, "_background_tasks", set()))
         context_token = (
             self._dispatch_generation_context.set(generation_key)
@@ -4589,6 +4949,16 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 self._commit_cursor(room_token, numeric_id)
             except BaseException as exc:
                 effective_outcome = ProcessingOutcome.FAILURE
+                hook_error = exc
+        elif (
+            effective_outcome == ProcessingOutcome.CANCELLED
+            and self._is_user_stopped_turn(event)
+        ):
+            # The user stopped (or reset) this turn with a slash command:
+            # acknowledge it, or the next poll would run it again.
+            try:
+                self._commit_cursor(room_token, numeric_id)
+            except BaseException as exc:
                 hook_error = exc
         elif effective_outcome == ProcessingOutcome.FAILURE:
             # Only a turn that actually ran and failed counts; cancellation,

@@ -70,6 +70,22 @@ Report any way to break one of these:
   is not newer than the message. Each thread has its own session. A thread's configured skill and
   prompt apply only to the thread this bot created or adopted, never to another thread with the
   same title.
+- **The busy-room lock opens only for the turn's owner.** While a turn runs, later room
+  messages stay on Talk. The only exceptions are a typed answer to that session's pending
+  `clarify` and a recognized Hermes slash command for the session that is actually busy, both
+  from the participant who owns the running turn; a slash command carrying an attachment never
+  passes as a command and causes no download (while a `clarify` is pending, the owner's message
+  with an attachment is still treated as a clarify answer, as in earlier releases). Another
+  participant, or a session that is not busy, cannot use the exception to reach or stop someone
+  else's turn. While a turn runs without a pending `clarify`, messages that do not qualify are
+  neither acknowledged nor downloaded, so they cannot exhaust the acknowledgement capacity; while
+  a `clarify` is pending the room is swept as in earlier releases (a flood can hold intake until
+  the clarify times out, a recoverable stall). A passed command is handed to Hermes at most once
+  per gateway process; known exceptions are a restart before its acknowledgement is stored,
+  more than 1024 commands whose acknowledgement could not be stored, and a turn that ends just
+  before the command is dispatched (then it runs as a normal turn with normal retries). A turn
+  Hermes cancelled for the owner's stop/reset command is acknowledged, while one whose stop
+  command failed stays retryable.
 - **Presentation calls are side effects only.** Status reactions and read markers are best
   effort and time-limited; their failure or delay must never change, delay, or duplicate a
   reply, and never change what is acknowledged.

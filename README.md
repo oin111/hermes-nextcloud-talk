@@ -12,6 +12,7 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Talk threads become Hermes topics: each thread has its own session, and replies go back into the thread.
 - Optional operator-defined topics: the bot creates named threads at startup, each with its own skill(s) and prompt.
 - Exact-session routing for typed `clarify` answers while a Hermes turn is blocked waiting for user input.
+- Slash commands such as `/approve`, `/deny` and `/stop` reach a running turn right away; other messages wait until the turn ends.
 - Automatic discovery of new one-to-one conversations.
 - Explicit group/public room configuration.
 - User allowlists, open-access mode, and optional bot-mention gating.
@@ -476,7 +477,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.16 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.17 is tested with Python 3.11–3.13. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

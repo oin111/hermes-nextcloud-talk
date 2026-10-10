@@ -2,6 +2,38 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.17] - 2026-10-10 (UTC)
+
+### Fixed
+
+- `/approve`, `/deny`, `/stop` and the other Hermes slash commands now reach a running turn.
+  While a turn ran, the adapter kept every later room message on Talk until the turn ended,
+  so an approval prompt always timed out and `/stop` arrived only after the work it was
+  meant to stop. A recognized slash command for the busy session, sent by the participant
+  who owns the running turn and carrying no attachment, now passes; all other messages
+  still wait and are handled after the turn, as before. Hermes core then handles the
+  command as it does on other platforms.
+- Such a command is settled at most once: it is acknowledged as soon as Hermes has handled
+  it, even if its reply could not be sent, because commands such as `/queue`, `/bg` or a
+  later `/approve` must never run twice. If storing that acknowledgement fails, the gateway
+  remembers the command in memory and later retries only the acknowledgement; after a
+  restart before it is stored, Talk may hand the command over once more. This also applies
+  while a `clarify` question is pending.
+- A turn that Hermes cancelled for the user's `/stop`, `/new` or `/reset` is acknowledged
+  rather than left retryable, so it is not run again on the next poll. A turn whose stop
+  command failed stays retryable as before.
+
+### Changed
+
+- While a turn runs, its room is still polled, but only for messages newer than the
+  newest one already seen (short 5 s long poll, no re-read of older held messages).
+  Messages that are not commands for the busy session are neither acknowledged nor
+  downloaded during the turn (unless a `clarify` question is pending, when the room is swept
+  as before), so a flood from other participants cannot fill the
+  acknowledgement capacity; a burst is read in bounded pages within one cycle, and an
+  oversized page is retried smaller. With several rooms, a command
+  is seen within one polling cycle (at most the configured poll timeout, 30 s by default).
+
 ## [0.1.16] - 2026-10-09 (UTC)
 
 ### Added

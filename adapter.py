@@ -2075,6 +2075,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             _cfg(extra, "NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS", "auto_discover_rooms", None),
             True,
         )
+        self.auto_discover_group_rooms = _truthy(
+            _cfg(extra, "NEXTCLOUD_TALK_AUTO_DISCOVER_GROUP_ROOMS", "auto_discover_group_rooms", None),
+            True,
+        )
         self.discovery_interval = max(
             5,
             int(_cfg(extra, "NEXTCLOUD_TALK_DISCOVERY_INTERVAL", "discovery_interval", 30)),
@@ -3753,9 +3757,18 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._room_types.update(metadata)
         configured = list(self._configured_room_tokens)
         configured_set = set(configured)
-        discovered = [room["token"] for room in conversations if room["type"] == 1] if self.auto_discover_rooms else []
-        if len(configured) + len([token for token in discovered if token not in configured_set]) > self.max_rooms:
-            raise NextcloudTalkAPIError("combined room count exceeds configured limit", category="overflow")
+        # Automatic group intake must never inherit unrestricted authorization.
+        # Explicit room tokens retain their existing authorization semantics.
+        discover_groups = (
+            self.auto_discover_group_rooms
+            and bool(self.group_allowed_users)
+            and "*" not in self.group_allowed_users
+            and not self.allow_all
+        )
+        discovered = [
+            room["token"] for room in conversations
+            if room["type"] == 1 or (room["type"] == 2 and discover_groups)
+        ] if self.auto_discover_rooms else []
         discovered_set = set(discovered) - configured_set
         previous_discovered = set(self._discovered_room_tokens)
         new_tokens = [token for token in discovered if token in discovered_set and token not in previous_discovered]
@@ -3790,6 +3803,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             if state is not None and state.get("active") is not False:
                 self._touch_ack_room(token, active=False)
                 ack_activity_changed = True
+        # Revocation is independent of admission: a full replacement listing
+        # must not keep a now-public automatic room eligible between refreshes.
+        if len(configured) + len(discovered_set) > self.max_rooms:
+            if ack_activity_changed:
+                self._persist_cursors()
+            raise NextcloudTalkAPIError("combined room count exceeds configured limit", category="overflow")
         for token in new_tokens:
             if process_new_messages and not self._is_room_initialized(token):
                 await self._initialize_room(token)
@@ -3800,7 +3819,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             if state is not None:
                 self._touch_ack_room(token, active=True)
                 ack_activity_changed = True
-            logger.info("[nextcloud_talk] Auto-discovered DM %s", self._safe_room_token(token))
+            logger.info("[nextcloud_talk] Auto-discovered %s %s",
+                        "DM" if metadata[token] == 1 else "group",
+                        self._safe_room_token(token))
         before_prune = len(self._ack_rooms)
         self._prune_ack_rooms()
         if ack_activity_changed or len(self._ack_rooms) != before_prune:

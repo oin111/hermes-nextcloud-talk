@@ -112,12 +112,31 @@ The legacy single-room variable is also supported:
 NEXTCLOUD_TALK_ROOM_TOKEN=roomtoken1
 ```
 
-One-to-one conversations are discovered automatically by default:
+One-to-one conversations are discovered automatically by default. Private group
+rooms (Talk type 2) are also discovered when group sender authorization is
+restrictive: the effective group allowlist must be non-empty, must not contain
+`*`, and `NEXTCLOUD_TALK_ALLOW_ALL_USERS` must be false. The effective allowlist
+is `NEXTCLOUD_TALK_ALLOWED_USERS` when non-blank, otherwise `extra.group_allow_from`;
+`extra.allow_from` alone does not enable automatic groups. Authorization still
+checks each sender's exact, stable `actorId` before dispatch or attachment I/O.
+Discovery does not grant access to room members or modify the allowlist.
 
 ```env
 NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS=true
+NEXTCLOUD_TALK_AUTO_DISCOVER_GROUP_ROOMS=true
 NEXTCLOUD_TALK_DISCOVERY_INTERVAL=30
 ```
+
+`NEXTCLOUD_TALK_AUTO_DISCOVER_GROUP_ROOMS` (YAML: `extra.auto_discover_group_rooms`)
+defaults to true, but the restrictive-allowlist requirement always applies, even
+when explicitly enabled. Set it to false to retain DM-only discovery.
+`NEXTCLOUD_TALK_AUTO_DISCOVER_ROOMS=false` disables all automatic discovery.
+Both switches use profile-scoped environment-over-YAML precedence.
+Public (type 3), system, note-to-self, and unknown room types are never discovered.
+Explicit room tokens remain unchanged, including under open authorization or
+with discovery disabled. Configured and discovered rooms share the existing
+`NEXTCLOUD_TALK_MAX_ROOMS` bound, backlog initialization, and durable cursors;
+removed discovered rooms stop intake without discarding acknowledged work.
 
 A room token is the final segment of a Talk URL such as:
 

@@ -6,6 +6,15 @@ All notable changes to this project will be documented here.
 
 ### Added
 
+- Automatic discovery of private group rooms (Talk type 2), guarded by a non-empty,
+  restrictive group sender allowlist. `NEXTCLOUD_TALK_AUTO_DISCOVER_GROUP_ROOMS`
+  (`extra.auto_discover_group_rooms`) defaults to true; false retains DM-only
+  discovery. The master `auto_discover_rooms` switch still disables all discovery.
+  Wildcard allowlists, missing group allowlists, and `ALLOW_ALL_USERS=true` never
+  enable automatic group intake, even with the new switch explicitly enabled.
+  Existing per-message stable user-ID authorization, explicit room behavior,
+  room-count limits, initialization, and durable acknowledgement lifecycle are
+  unchanged. Public, system, note-to-self, and unknown types remain excluded.
 - Native execution-approval reactions: ✅ once, 🌀 session, ♾️ always and ❌ deny,
   seeded only for choices offered by Hermes. Reactions are consumed through the existing
   chat poll, never dispatched as agent turns, and acknowledged through the prefix-floor

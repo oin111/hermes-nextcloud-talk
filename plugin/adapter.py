@@ -2199,6 +2199,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         )
         self._approval_prompts_by_event: Dict[str, _ApprovalReactionPrompt] = {}
         self._approval_prompt_by_session: Dict[str, str] = {}
+        # Construction-time sends remain supported; disconnect retires this token.
+        self._approval_lifecycle_generation = object()
 
     @property
     def name(self) -> str:
@@ -2569,6 +2571,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 self._topics_task = asyncio.create_task(self._ensure_thread_topics_bounded())
             rooms_safe = ", ".join(self._safe_room_token(t) for t in self.room_tokens)
             logger.info("[nextcloud_talk] Connected to rooms: %s", rooms_safe)
+            self._approval_lifecycle_generation = object()
             self._mark_connected()
             return True
         except BaseException as exc:
@@ -2592,6 +2595,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return False
 
     async def disconnect(self) -> None:
+        # Fence externally scheduled card POSTs/seeds before teardown first yields.
+        self._approval_lifecycle_generation = None
+        self._approval_prompts_by_event.clear()
+        self._approval_prompt_by_session.clear()
         self._running = False
         if self._poll_task and not self._poll_task.done():
             self._poll_task.cancel()
@@ -2661,10 +2668,6 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._inflight_message_ids.clear()
         self._initializing_rooms.clear()
         self._release_cursor_writer()
-        # Pending reaction prompts are process-local; drop them on disconnect so a
-        # stale prompt cannot resolve a future session's approval.
-        self._approval_prompts_by_event.clear()
-        self._approval_prompt_by_session.clear()
         self._mark_disconnected()
         logger.info("[nextcloud_talk] Disconnected")
 
@@ -4094,13 +4097,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         id, then seed one reaction per offered choice (bot-only). Any failure to
         seed degrades to the gateway's text fallback — never to a silently dead
         prompt with fewer buttons than choices."""
-        if not self._client:
+        client = self._client
+        # Legacy/test construction via __new__ has no lifecycle state yet. Only
+        # an explicit disconnect (None), not absence, closes that send surface.
+        if not hasattr(self, "_approval_lifecycle_generation"):
+            self._approval_lifecycle_generation = object()
+        generation = self._approval_lifecycle_generation
+        if not client or generation is None:
             return SendResult(success=False, error="Not connected")
         session_key = str(prompt.session_key or "")
         chat_id = str(prompt.chat_id or "")
         if not session_key or not chat_id:
             return SendResult(success=False, error="Approval prompt missing session or room")
         result = await self.send(chat_id, prompt.text, metadata=prompt.metadata)
+        if self._approval_lifecycle_generation is not generation:
+            return SendResult(success=False, error="Approval lifecycle ended", message_id=result.message_id)
         if not result.success or not result.message_id:
             return result
         message_id = result.message_id
@@ -4128,14 +4139,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         seeded: List[str] = []
         try:
             for emoji in reactions:
+                if self._approval_lifecycle_generation is not generation:
+                    raise RuntimeError("Approval lifecycle ended")
                 # Record BEFORE the await: a failed POST may still have landed
                 # server-side (429 after commit), so the conservative cleanup
                 # retracts the emoji even when the call raised.
                 seeded.append(emoji)
-                await self._client.add_reaction(
+                await client.add_reaction(
                     chat_id, int(message_id), emoji
                 )
+                if self._approval_lifecycle_generation is not generation:
+                    raise RuntimeError("Approval lifecycle ended")
                 await asyncio.sleep(0.25)
+                if self._approval_lifecycle_generation is not generation:
+                    raise RuntimeError("Approval lifecycle ended")
         except Exception as exc:
             logger.warning(
                 "[nextcloud_talk] Approval reactions %s could not be seeded (%s); "
@@ -4148,7 +4165,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             ]
             for seed in cleanup:
                 try:
-                    await self._client.remove_reaction(chat_id, int(message_id), seed)
+                    await client.remove_reaction(chat_id, int(message_id), seed)
                 except Exception:
                     pass
             return SendResult(
@@ -4234,7 +4251,9 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             # Not one of ours (or already settled): hand the row back to the
             # regular poll flow, which skips system messages on its own.
             return False
-        actor_id = str(msg.get("actorId") or "").strip()
+        # Stable actor IDs are exact authorization keys, as in normal intake/core.
+        raw_actor_id = msg.get("actorId")
+        actor_id = raw_actor_id if isinstance(raw_actor_id, str) else ""
         actor_name = str(msg.get("actorDisplayName") or "").strip()
         # Room-binding gate: a reaction row from a DIFFERENT room never resolves a prompt.
         if prompt.chat_id != room_token:

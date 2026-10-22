@@ -542,10 +542,16 @@ class ReactionQueryEncodingTests(unittest.IsolatedAsyncioTestCase):
 
 
 class SupportsExecApprovalButtonsTests(unittest.TestCase):
+    @unittest.skipUnless(
+        hasattr(adapter.BasePlatformAdapter, "supports_exec_approval_buttons"),
+        "Hermes runtime predates the native execution-approval capability API",
+    )
     def test_runner_detects_native_buttons(self):
         self.assertTrue(adapter.NextcloudTalkAdapter.supports_exec_approval_buttons())
-        self.assertIsNotNone(adapter.NextcloudTalkAdapter.send_exec_approval)
-        self.assertIsNotNone(adapter.NextcloudTalkAdapter._send_exec_approval_prompt)
+
+    def test_adapter_exposes_approval_hooks_on_every_runtime(self):
+        self.assertTrue(callable(adapter.NextcloudTalkAdapter.send_exec_approval))
+        self.assertTrue(callable(adapter.NextcloudTalkAdapter._send_exec_approval_prompt))
 
 
 if __name__ == "__main__":

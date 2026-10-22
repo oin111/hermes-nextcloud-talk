@@ -8,6 +8,7 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 
 - Native `nextcloud_talk` platform inside Hermes Gateway.
 - Standard Hermes sessions, memory, tools, approvals, slash commands, and reply routing.
+- Native execution approvals through Talk reactions: ✅ once, 🌀 session, ♾️ always, ❌ deny.
 - Concurrent polling of multiple Talk rooms with independent message cursors.
 - Talk threads become Hermes topics: each thread has its own session, and replies go back into the thread.
 - Optional operator-defined topics: the bot creates named threads at startup, each with its own skill(s) and prompt.
@@ -25,6 +26,36 @@ It connects Hermes directly to Talk through the Spreed OCS API. It does **not** 
 - Python standard library only at runtime.
 
 ## Requirements
+
+### Native reaction approvals (0.1.18)
+
+Hermes approval cards seed only the choices the core offered. React to the card in
+the same room; the existing chat poll consumes the reaction without starting another
+agent turn, and its ACK participates in the normal prefix-floor ledger. The room keeps
+polling while an approval is pending, even if seeding fails or the card expires.
+Seeding failure retracts attempted bot reactions and returns failure so Hermes can
+use its plain-text approval fallback. `/approve`, `/deny` and `/stop` keep the existing
+busy-session owner checks independently of the native-reaction path.
+
+**Authorization is the room's effective user allowlist, not requester binding.**
+Released Hermes does not pass `requester_user_id` or an approval request ID into this
+adapter hook. Any allowlisted participant in the card's room may therefore answer it;
+use a private room and a narrow allowlist for sensitive approvals. Display names do not
+authorize anyone. Without request-ID metadata, a tap resolves the oldest pending
+approval in that session (FIFO), which need not be the newest displayed card. A
+compatible caller may supply `approval_request_id` metadata to bind an exact request.
+Bot seed reactions, removals, unknown emoji and choices not offered on the card never
+approve. Cards are process-local and cleared on disconnect.
+
+`NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS` (YAML `approval_timeout_seconds`) overrides card
+expiry, otherwise Hermes `approvals.timeout` is used, then a 3600-second fallback.
+This does not extend the core's actual approval deadline. Expired cards are pruned
+on the existing room-poll path. A tap resolving no pending request is logged at WARNING.
+After an ACK-store failure, in-process replay retries only the ACK through the same
+bounded settlement cache as slash commands; a restart or cache eviction before ACK
+persistence can still replay an unbound tap against the then-current FIFO head.
+
+### Runtime
 
 - Hermes Agent 0.20.6 or newer (typed `clarify` reply routing is required).
 - Python 3.11 or newer.
@@ -477,7 +508,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.17 is tested with Python 3.11–3.13. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.18 targets the Python 3.11–3.13 CI matrix. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

@@ -159,7 +159,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.17"
+_RELEASED_VERSION = "0.1.18"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -1165,23 +1165,6 @@ class NextcloudTalkClient:
                 seen.add(token)
                 result.append({"token": token, "type": conversation_type})
         return result
-
-    async def list_channels(self) -> List[dict]:
-        """Directory hook: DMs und Gruppenraeume fuer send-Ziel-Aufloesung (LOR-061)."""
-        raw = await asyncio.to_thread(
-            self._ocs_get, "/ocs/v2.php/apps/spreed/api/v4/room", expected_types=(list,)
-        )
-        channels: List[dict] = []
-        for conversation in raw if isinstance(raw, list) else []:
-            if not isinstance(conversation, dict):
-                continue
-            token = conversation.get("token")
-            name = conversation.get("displayName") or conversation.get("name") or ""
-            ctype = conversation.get("type")
-            if not token or not name:
-                continue
-            channels.append({"id": str(token), "name": str(name), "type": "group" if ctype != 1 else "dm"})
-        return channels
 
     async def list_conversation_tokens(self) -> List[str]:
         return [room["token"] for room in await self.list_conversations() if room["type"] == 1]
@@ -3827,9 +3810,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         assert self._client is not None
         try:
             self._ensure_ack_runtime()
+            self._prune_expired_approval_prompts()
             room_inflight = bool(self._inflight_message_ids.get(room_token))
             if room_inflight and not self._room_has_pending_clarify(room_token):
-                if self._room_has_busy_session(room_token):
+                if (self._room_has_busy_session(room_token)
+                        or self._room_has_pending_approval_prompt(room_token)
+                        or self._room_has_pending_exec_approval(room_token)):
                     await self._poll_inflight_commands(room_token)
                 return
             max_batch = getattr(self, "max_poll_batch", _DEFAULT_MAX_POLL_BATCH)
@@ -3884,6 +3870,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                             return
                     cycle_dispatched.add(message_id)
                     try:
+                        if await self._handle_approval_system_message(batch[message_id], room_token):
+                            continue
                         await self._handle_talk_message(batch[message_id], room_token)
                     except asyncio.CancelledError:
                         raise
@@ -4062,8 +4050,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # requests and carries the actor inline, so unlike an active get_reactions
     # delta-poller it needs no per-prompt API traffic, no per-prompt state about
     # which actors were already seen, and no races between poll cycles. The
-    # reactions GET route remains available on the client for ad-hoc inspection
-    # only. Bot-seeded reactions are never treated as answers (requirement 3):
+    # Bot-seeded reactions are never treated as answers:
     # self rows are skipped by username comparison before any prompt lookup.
 
     async def send_exec_approval(
@@ -4124,7 +4111,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 # server-side (429 after commit), so the conservative cleanup
                 # retracts the emoji even when the call raised.
                 seeded.append(emoji)
-                await self._client.react_to_message(
+                await self._client.add_reaction(
                     chat_id, int(message_id), emoji
                 )
                 await asyncio.sleep(0.25)
@@ -4209,6 +4196,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         numeric_id = _strict_talk_message_id(msg.get("id"))
         if numeric_id is None:
             return False
+        self._ensure_ack_runtime()
+        if self._is_acknowledged(room_token, numeric_id):
+            return True
+        if (room_token, numeric_id) in self._settled_commands:
+            self._commit_cursor(room_token, numeric_id)
+            self._settled_commands.pop((room_token, numeric_id), None)
+            return True
         target_id = msg.get("parent")
         if isinstance(target_id, dict):
             # Some server versions nest the parent object instead of the bare id.
@@ -4221,6 +4215,14 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             return False
         actor_id = str(msg.get("actorId") or "").strip()
         actor_name = str(msg.get("actorDisplayName") or "").strip()
+        # Room-binding gate: a reaction row from a DIFFERENT room never resolves a prompt.
+        if prompt.chat_id != room_token:
+            logger.info(
+                "[nextcloud_talk] Ignoring approval reaction in room %s; prompt lives in %s",
+                self._safe_room_token(room_token), self._safe_room_token(prompt.chat_id),
+            )
+            self._commit_cursor(room_token, numeric_id)
+            return True
         # Expired prompts retire on any reaction row — the emoji's author has no
         # bearing on whether the controls are still live.
         if self._approval_prompt_expired(prompt):
@@ -4233,18 +4235,13 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._commit_cursor(room_token, numeric_id)
             return True
         chat_type = "dm" if self._room_types.get(room_token) == 1 else "group"
-        # Room-binding gate: a reaction row from a DIFFERENT room never resolves a prompt.
-        if prompt.chat_id != room_token:
-            logger.info(
-                "[nextcloud_talk] Ignoring approval reaction in room %s; prompt lives in %s",
-                self._safe_room_token(room_token), self._safe_room_token(prompt.chat_id),
-            )
-            self._commit_cursor(room_token, numeric_id)
-            return True
         choice = self._resolve_approval_choice(msg, room_token, prompt, actor_id, actor_name, chat_type)
         if choice is None:
             self._commit_cursor(room_token, numeric_id)
             return True
+        # Resolution is not idempotent: an unbound tap consumes the FIFO head.
+        # Reuse the bounded command-settlement cache if ACK persistence fails.
+        self._remember_settled_command(room_token, numeric_id)
         resolved_count = 0
         try:
             from tools.approval import resolve_gateway_approval
@@ -4295,6 +4292,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             # Expiry is the only thing that retires a prompt — see the expiry branch above and
             # test_denials_when_gateway_has_nothing_pending_retire_expired_prompt_only.
         self._commit_cursor(room_token, numeric_id)
+        self._settled_commands.pop((room_token, numeric_id), None)
         return True
 
     def _session_has_blocking_approval(self, session_key: str) -> bool:
@@ -4323,6 +4321,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """Gate chain: allowed sender -> (optionally) the prompt's requester ->
         known emoji -> offered choice. None means consumed-and-ignored."""
         emoji = str(msg.get("message") or "").strip()
+        if not isinstance(msg.get("actorId"), str) or not msg["actorId"].strip():
+            return None
+        if msg.get("systemMessage") != "reaction":
+            return None
+        if str(msg.get("actorType") or "").lower() not in {"users", "guests"}:
+            return None
         if not self._is_allowed(actor_id, actor_name, chat_type=chat_type):
             logger.debug(
                 "[nextcloud_talk] Ignoring approval reaction from unauthorized user %s",
@@ -4463,10 +4467,29 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._note_live_anchor(room_token, message_id)
             if self._is_acknowledged(room_token, message_id):
                 continue
+            if (msg.get("systemMessage") in _APPROVAL_REACTION_SYSTEM_MESSAGES
+                    and getattr(self, "_approval_prompts_by_event", None)):
+                # Only known-card rows bypass the busy hold. Their observations
+                # use the same prefix ledger as normal intake.
+                parent = msg.get("parent")
+                if isinstance(parent, dict):
+                    parent = parent.get("id")
+                prompt = self._approval_prompts_by_event.get(str(parent))
+                actor = msg.get("actorId")
+                chat_type = "dm" if self._room_types.get(room_token) == 1 else "group"
+                if (prompt is not None and prompt.chat_id == room_token
+                        and isinstance(actor, str) and actor.strip()
+                        and str(msg.get("actorType") or "").lower() in {"users", "guests"}
+                        and self._is_allowed(actor, "", chat_type=chat_type)):
+                    self._observe_room_ids(room_token, [message_id])
+                    candidates[message_id] = msg
+                    continue
             if self._inflight_command_candidate(msg, room_token, message_id):
                 candidates[message_id] = msg
         for message_id in sorted(candidates):
             try:
+                if await self._handle_approval_system_message(candidates[message_id], room_token):
+                    continue
                 await self._handle_talk_message(candidates[message_id], room_token)
             except asyncio.CancelledError:
                 raise
@@ -5255,14 +5278,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 else:
                     text = text.replace("{" + key + "}", fname)
 
-        require_mention = self._requires_mention(chat_type)
-        text = self._strip_bot_mention(text, require_mention=require_mention)
-        if require_mention and not text:
-            logger.warning(
-                "[nextcloud_talk] Skipping message %s in room %s: mention required "
-                "but none found (chat_type=%s)",
-                _safe_log_text(msg_id, 64), self._safe_room_token(room_token), chat_type,
-            )
+        text = self._strip_bot_mention(text)
+        if self.require_mention and not text:
             self._commit_cursor(room_token, numeric_id)
             return
 
@@ -5456,15 +5473,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         allowed = self.group_allowed_users if chat_type in {"group", "forum", "channel"} else self.allowed_users
         return "*" in allowed or stable_id in allowed
 
-    def _requires_mention(self, chat_type: str) -> bool:
-        """Require an explicit bot mention in shared rooms, never in direct messages."""
-        return self.require_mention and chat_type != "dm"
-
-    def _strip_bot_mention(self, text: str, *, require_mention: Optional[bool] = None) -> str:
+    def _strip_bot_mention(self, text: str) -> str:
         raw = text.strip()
-        mention_required = self.require_mention if require_mention is None else require_mention
         if not self.bot_name:
-            return raw if not mention_required else ""
+            return raw if not self.require_mention else ""
         escaped = re.escape(self.bot_name.strip())
         patterns = [
             rf"^@?{escaped}[:,\s]+(.+)$",
@@ -5474,7 +5486,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             match = re.match(pattern, raw, flags=re.IGNORECASE | re.DOTALL)
             if match:
                 return match.group(1).strip()
-        return "" if mention_required else raw
+        return "" if self.require_mention else raw
 
     @staticmethod
     def _timestamp_from_message(msg: Dict[str, Any]) -> datetime:
@@ -6011,22 +6023,6 @@ def validate_config(config) -> bool:
 
 
 def is_connected(config) -> bool:
-    # Env-gestützte Prüfung — scope-aware (get_scoped_secret, wie die Core-Plattformen):
-    # die Cron-Preflight-Checks und Statusanzeigen rufen dies mit einer rohen
-    # PlatformConfig (extra={}) — validate_config allein liest nur YAML-extra und
-    # meldet fälschlich "nicht verbunden". Unter Multiplex borriert der scoped
-    # Read NIE den Launcher (sekundäres Profil ohne eigene Creds bleibt disconnected).
-    try:
-        from gateway.platforms._shared import get_scoped_secret
-        # external_fallback: startup gates run before any scope exists — the
-        # profile's OWN .env is consulted (never another profile's values).
-        url = str(get_scoped_secret("NEXTCLOUD_TALK_URL", external_fallback=True) or "").strip()
-        user = str(get_scoped_secret("NEXTCLOUD_TALK_USERNAME", external_fallback=True) or "").strip()
-        pw = str(get_scoped_secret("NEXTCLOUD_TALK_PASSWORD", external_fallback=True) or "").strip()
-        if url and user and pw:
-            return True
-    except Exception:
-        pass
     return validate_config(config)
 
 
@@ -6097,60 +6093,6 @@ def interactive_setup() -> None:
     print_info("Restart the gateway: hermes gateway restart")
 
 
-def _standalone_client(extra: Optional[dict]) -> NextcloudTalkClient:
-    """Build a Talk client from this profile's config (env -> YAML extra), mirroring the adapter."""
-    url = _cfg(extra, "NEXTCLOUD_TALK_URL", "url", "")
-    username = _cfg(extra, "NEXTCLOUD_TALK_USERNAME", "username", "")
-    password = _cfg(extra, "NEXTCLOUD_TALK_PASSWORD", "password", "")
-    if not (url and username and password):
-        raise ValueError(
-            "NEXTCLOUD_TALK_URL / NEXTCLOUD_TALK_USERNAME / NEXTCLOUD_TALK_PASSWORD are not configured"
-        )
-    return NextcloudTalkClient(url, username, password)
-
-
-async def _nc_standalone_send(
-    pconfig, chat_id: str, message: str, *, thread_id: Optional[str] = None,
-    media_files: Optional[list] = None, force_document: bool = False,
-) -> Dict[str, Any]:
-    """Out-of-process cron delivery: send via the Talk REST API without a live gateway adapter.
-
-    Text goes to the chat endpoint; media files are uploaded to Nextcloud Files and shared
-    into the room (same path the live adapter uses). ``thread_id``/``force_document`` have
-    no Talk equivalent and are ignored."""
-    try:
-        extra = getattr(pconfig, "extra", {}) or {}
-        client = _standalone_client(extra)
-        warnings: List[str] = []
-        text = (message or "").strip()
-        message_id: Any = None
-        if text:
-            sent = await client.send_message(chat_id, text)
-            if isinstance(sent, dict):
-                message_id = sent.get("id")
-        valid_media = [
-            path for path, _is_voice in (media_files or []) if path
-        ]
-        for media_path in valid_media:
-            if not os.path.exists(media_path):
-                warnings.append(f"media file missing: {media_path}")
-                continue
-            folder = _cfg(extra, "NEXTCLOUD_TALK_UPLOAD_FOLDER", "upload_folder", "/Hermes Uploads")
-            await client.upload_and_share_file(media_path, chat_id, folder)
-        if not text and not (media_files and valid_media):
-            return {"error": "Nextcloud Talk standalone send: empty message and no media"}
-        result: Dict[str, Any] = {"success": True}
-        if message_id is not None:
-            result["message_id"] = message_id
-        if warnings:
-            result["warnings"] = warnings
-        return result
-    except NextcloudTalkAPIError as exc:
-        return {"error": f"Nextcloud Talk standalone send failed: {_safe_outward_error_text(exc)}"}
-    except Exception as exc:  # keep cron delivery failures structured, never raise past the sender
-        return {"error": f"Nextcloud Talk standalone send failed ({type(exc).__name__})"}
-
-
 def register(ctx) -> None:
     ctx.register_platform(
         name="nextcloud_talk",
@@ -6171,8 +6113,6 @@ def register(ctx) -> None:
         max_message_length=_DEFAULT_MAX_MESSAGE_LENGTH,
         emoji="☁️",
         allow_update_command=True,
-        cron_deliver_env_var="NEXTCLOUD_TALK_HOME_CHANNEL",
-        standalone_sender_fn=_nc_standalone_send,
         platform_hint=(
             "You are chatting via Nextcloud Talk (multi-room). Talk renders Markdown: bold, lists, "
             "code blocks, links and simple tables work; images are shown as link previews. "

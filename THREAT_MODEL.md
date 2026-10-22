@@ -55,6 +55,14 @@ Report any way to break one of these:
 - **Credentials stay on one origin.** Authenticated requests go only to the configured scheme,
   host, and port; cross-origin redirects are refused; attachment URLs must resolve to the same
   origin.
+- **Native approval reactions are an explicit system-message exception.** A reaction
+  must target a registered card in the same room, have a stable authorized user/guest
+  actor, and select an offered choice; bot seeds and reaction removals cannot approve.
+  Released Hermes provides no requester or request ID in the adapter hook, so the
+  effective room user allowlist is the authority: another allowlisted room participant
+  may answer. An unbound tap resolves the session's oldest pending approval (FIFO),
+  not necessarily the newest card. Exact request binding applies only when a caller
+  supplies optional request-ID metadata. Do not claim requester isolation.
 - **Filesystem confinement.** Downloaded files land only in the Hermes document cache directory
   with a sanitized name; WebDAV paths are decoded a bounded number of times and refused if absolute,
   ambiguous, containing traversal components, or escaping the user's namespace.
@@ -86,6 +94,10 @@ Report any way to break one of these:
   before the command is dispatched (then it runs as a normal turn with normal retries). A turn
   Hermes cancelled for the owner's stop/reset command is acknowledged, while one whose stop
   command failed stays retryable.
+  Native approval-card reactions also pass the hold under the separate room/allowlist
+  policy above, not the slash command's owner policy. Their consumed IDs use the same
+  prefix ACK ledger and bounded in-process settlement cache; restart or eviction before
+  an ACK is stored can replay an unbound tap against a later FIFO request.
 - **Presentation calls are side effects only.** Status reactions and read markers are best
   effort and time-limited; their failure or delay must never change, delay, or duplicate a
   reply, and never change what is acknowledged.

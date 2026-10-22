@@ -2,6 +2,33 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.18] - 2026-10-22 (UTC)
+
+### Added
+
+- Native execution-approval reactions: ✅ once, 🌀 session, ♾️ always and ❌ deny,
+  seeded only for choices offered by Hermes. Reactions are consumed through the existing
+  chat poll, never dispatched as agent turns, and acknowledged through the prefix-floor
+  ledger, including while an approval-blocked turn remains in flight.
+- Approval-card expiry uses `NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS` / YAML
+  `approval_timeout_seconds`, then Hermes `approvals.timeout`, then a 3600-second fallback.
+  Seeding failure retracts attempted seeds and returns failure for the core text fallback.
+
+### Security and compatibility
+
+- Reactions must target a registered card in the same room and pass that room's effective
+  user allowlist; bot seeds, removed reactions and unoffered choices never approve.
+- Released Hermes does not supply requester identity or request ID to this adapter hook.
+  Any allowlisted participant in the room can answer; the response resolves the oldest
+  pending request in that session (FIFO), not necessarily the newest displayed card.
+  Optional request-ID metadata is honored when provided by a compatible caller.
+- Preserve v0.1.17 owner/session-isolated slash-command routing, pending-approval polling
+  after card failure/expiry, and current cursor semantics. Prune cards on every room poll.
+  ACK-store failures retry only a reaction's ACK in process, using the existing bounded
+  settlement cache; restart or eviction before persistence retains the documented replay risk.
+- Keep current scoped configuration validation and routing; omit the stale contributor
+  standalone cron sender and client-directory additions, which are unrelated to approvals.
+
 ## [0.1.17] - 2026-10-10 (UTC)
 
 ### Fixed
@@ -220,52 +247,6 @@ All notable changes to this project will be documented here.
 
 - Add real-Hermes startup, partial-retry, cross-room progress, disconnect, discovery
   removal, task cleanup and in-flight acknowledgement regressions to CI.
-
-## [0.1.12] - 2026-09-26
-
-### Added
-
-- **Unified approval reactions (Matrix-parity)** — merge of the Mini production build
-  (reaction-driven exec approvals: ✅ once / 🌀 session / ♾️ always / ❌ deny, seeded on the
-  approval prompt, consumed inline by the poll loop, requester + allowlist gated, timeout
-  via `NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS` / YAML `approval_timeout_seconds` / gateway
-  `approvals.timeout`, default 3600 s) with the Studio 0.1.11 hardening that the reaction
-  path needs: `list_channels` directory hook (LOR-061 send-target resolution),
-  standalone out-of-process cron sender (`standalone_sender_fn=_nc_standalone_send`),
-  and the per-chat-type mention policy — `require_mention` now never applies to DMs
-  (`_requires_mention(chat_type)`), closing the gap where a strict `require_mention`
-  config silently dropped every direct message.
-
-### Fixed
-
-- DM messages are no longer dropped when `NEXTCLOUD_TALK_REQUIRE_MENTION` is set:
-  mention enforcement is scoped to shared rooms (group/forum/channel), DMs always pass.
-- **Polling no longer aborts when an adapter has no approval registry.**
-  `_prune_expired_approval_prompts` read `_approval_prompts_by_event` unguarded while being
-  called from inside `_poll_room`'s `try` block, so instances that never ran the approval init
-  path raised `AttributeError` there and the generic handler swallowed it — the whole message
-  batch was dropped with no log line. Now guarded like its two siblings. This was the single
-  cause of 34 failures across the attachment, network-failure and cursor paths in
-  `test_adapter`; with the guard the suite is green again (111 tests).
-- **A reaction that resolves nothing is now logged at WARNING.** The success log sat behind
-  `if resolved_count:` and `resolve_gateway_approval` returns `0` for an empty queue, so a
-  dead button was indistinguishable in the log from "the user never reacted". The new line
-  reports the emoji, choice, actor, session, bound `request_id` and whether core still holds a
-  pending request (`has_blocking_approval`). The prompt itself is deliberately NOT retired —
-  the request may have been settled through another surface; expiry stays the only retirement.
-- **Second, independent poll keepalive for pending exec approvals**
-  (`_room_has_pending_exec_approval`). The existing keepalive required a successfully seeded
-  reaction card, so polling froze in two cases and the approval became unanswerable on every
-  surface for the full `approvals.timeout`: (1) seeding failed (Talk 429) and the gateway
-  degraded to its plain-text `/approve` prompt, leaving nothing registered; (2) the card
-  expired while core still held the request, hiding a late answer, `/stop` or `/new`. The new
-  check asks `tools.approval.has_blocking_approval` for in-flight turns in that room.
-
-### Tests
-
-- Three regression tests in `PollPathIntakeTests`: poll survives a missing registry, core-side
-  pending approval keeps polling without a card, and a zero-resolution reaction logs at WARNING.
-
 
 ## [0.1.10] - 2026-09-15
 

@@ -73,7 +73,7 @@ class ApprovalReactionTestBase(unittest.IsolatedAsyncioTestCase):
 
         instance._client = types.SimpleNamespace(
             send_message=send_message,
-            react_to_message=self._record_reaction,
+            add_reaction=self._record_reaction,
             remove_reaction=self._record_removal,
         )
         instance.sent_messages = sent
@@ -151,7 +151,7 @@ class SendExecApprovalSeedsReactionsTests(ApprovalReactionTestBase):
 
         instance._client = types.SimpleNamespace(
             send_message=instance._client.send_message,
-            react_to_message=broken_react,
+            add_reaction=broken_react,
             remove_reaction=removal,
         )
         result = await instance._send_exec_approval_prompt(_approval_prompt())
@@ -487,26 +487,14 @@ class ApprovalTimeoutTests(ApprovalReactionTestBase):
 
     def test_timeout_falls_back_to_gateway_approvals_timeout(self):
         with patch.dict(adapter.os.environ, {"NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS": ""}):
-            import sys as _sys
             module = types.ModuleType("gateway.platforms.base_exec_approval")
             module.approval_timeout_seconds = lambda: 300
-            gateway_mod = _sys.modules.get("gateway")
-            platforms_mod = _sys.modules.get("gateway.platforms")
-            _sys.modules["gateway.platforms.base_exec_approval"] = module
-            try:
+            with patch.dict(sys.modules, {"gateway.platforms.base_exec_approval": module}):
                 self.assertEqual(adapter._resolve_approval_timeout_seconds({}), 300.0)
-            finally:
-                if gateway_mod is None:
-                    _sys.modules.pop("gateway", None)
-                if platforms_mod is None:
-                    _sys.modules.pop("gateway.platforms", None)
-                _sys.modules.pop("gateway.platforms.base_exec_approval", None)
 
     def test_timeout_rejects_nonpositive_and_garbage(self):
         with patch.dict(adapter.os.environ, {"NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS": "-5"}):
-            import sys as _sys
-            _sys.modules.pop("gateway.platforms.base_exec_approval", None)
-            # No gateway module importable in the standalone loader -> final default.
+            # Invalid overrides fall back to the installed core's timeout.
             value = adapter._resolve_approval_timeout_seconds({})
             self.assertGreaterEqual(value, 1.0)
         with patch.dict(adapter.os.environ, {"NEXTCLOUD_APPROVAL_TIMEOUT_SECONDS": "zero"}):
@@ -542,7 +530,7 @@ class ReactionQueryEncodingTests(unittest.IsolatedAsyncioTestCase):
         client.timeout = 5
         client.max_json_bytes = 1 << 20
         client.max_body_bytes = 1 << 20
-        url = client._reaction_url("roomTok", 4242)
+        url = client.base_url + client._spreed_endpoint("reaction", "roomTok", "/4242")
         self.assertEqual(
             url, "https://cloud.example/ocs/v2.php/apps/spreed/api/v1/reaction/roomTok/4242"
         )

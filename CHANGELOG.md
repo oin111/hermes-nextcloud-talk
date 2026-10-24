@@ -2,6 +2,20 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.20] - 2026-10-24 (UTC)
+
+### Fixed
+
+- Keep Talk lifecycle generation, task and completion-waiter state private to the
+  original event rather than passing it as native admission metadata. Ordinary
+  Talk inputs now satisfy Hermes cores with a closed metadata schema without
+  weakening native validation or sender authorization.
+- Preserve exact queued-event ownership and completion tracking; reconstructed
+  native inputs do not inherit live tasks, waiters or stale generations.
+- Add real native admission and restoration regressions, authorization and unknown
+  metadata controls, busy-queue waiter identity, persisted ACK and replay checks.
+  Existing image-batch delivery and cancellation fixes from 0.1.19 are retained.
+
 ## [0.1.19] - 2026-10-24 (UTC)
 
 ### Fixed

@@ -42,12 +42,20 @@ jobs:
       # actions/setup-python v5.6.0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065
         with:
-          python-version: "3.11"
+          # This core supports 3.14; its <3.14 package is only an updater bridge
+          # and deliberately omits runtime dependencies.
+          python-version: "3.14"
       - name: Install Hermes runtime with native admission
         run: |
           git clone --filter=blob:none https://github.com/NousResearch/hermes-agent.git "${RUNNER_TEMP}/hermes-agent"
           git -C "${RUNNER_TEMP}/hermes-agent" checkout 571a5911ae6aaa05ef3df53bf0f6720c4556c24a
-          python -m pip install -e "${RUNNER_TEMP}/hermes-agent"
+          # Use the core's committed lock and security overrides (plain pip's
+          # resolver cannot reconcile browser-harness's older Pillow pin).
+          python -m pip install uv==0.12.6
+          python -m uv sync --project "${RUNNER_TEMP}/hermes-agent" --python "$(command -v python)" --frozen --no-default-groups
+          python -m uv sync --project "${RUNNER_TEMP}/hermes-agent" --frozen --no-default-groups --check
+          echo "${RUNNER_TEMP}/hermes-agent/.venv/bin" >> "$GITHUB_PATH"
+          "${RUNNER_TEMP}/hermes-agent/.venv/bin/python" -c "import sys, ruamel.yaml; assert sys.version_info[:2] == (3, 14)"
       - name: Require real native codec and run every test module
         run: |
           python -c "from gateway.session_envelope import prepare_native, restore_native"

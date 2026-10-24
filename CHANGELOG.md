@@ -2,6 +2,16 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.21] - 2026-10-24 (UTC)
+
+### Fixed
+
+- Run the pinned modern native-admission CI job on its supported Python 3.14,
+  installing its declared runtime dependencies and checking dependency consistency
+  before the real native codec, full module suite and Plugin Doctor gates.
+- Retain the Python 3.11–3.13 compatibility matrix and all existing core pins.
+  This supersedes 0.1.20's broken native CI setup; plugin runtime behavior is unchanged.
+
 ## [0.1.20] - 2026-10-24 (UTC)
 
 ### Fixed

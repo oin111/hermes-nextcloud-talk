@@ -159,7 +159,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.18"
+_RELEASED_VERSION = "0.1.19"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -2457,14 +2457,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def send_multiple_images(self, chat_id: str, images: List[Any],
                                    metadata: Optional[Dict[str, Any]] = None,
-                                   human_delay: float = 0.0) -> None:
-        """Mirror Hermes image delivery while retaining failures for ACK gating."""
+                                   human_delay: float = 0.0) -> SendResult:
+        """Report batch delivery to Base while retaining failures for ACK gating."""
         self._ensure_ack_runtime()
         generation_key = self._dispatch_generation_context.get()
+        all_succeeded = bool(images)
         for image_url, alt_text in images:
             if human_delay > 0:
                 await asyncio.sleep(human_delay)
-            failed = False
+            failed = True
             try:
                 if image_url.startswith("file://"):
                     result = await self.send_image_file(
@@ -2482,14 +2483,21 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                         caption=alt_text or None, metadata=metadata,
                     )
                 failed = not (isinstance(result, SendResult) and result.success is True)
-            except BaseException:
-                failed = True
-            if failed and generation_key is not None and self._generation_is_current(generation_key):
-                state = self._generation_outcomes.setdefault(generation_key, {})
-                state["media_delivery_failed"] = True
-                state["media_failure_count"] = min(
-                    1024, int(state.get("media_failure_count", 0)) + 1
-                )
+            except Exception:
+                pass
+            finally:
+                if failed:
+                    all_succeeded = False
+                    if generation_key is not None and self._generation_is_current(generation_key):
+                        state = self._generation_outcomes.setdefault(generation_key, {})
+                        state["media_delivery_failed"] = True
+                        state["media_failure_count"] = min(
+                            1024, int(state.get("media_failure_count", 0)) + 1
+                        )
+        return SendResult(
+            success=all_succeeded,
+            error=None if all_succeeded else "image batch delivery incomplete",
+        )
 
     async def _notify_media_delivery_failure(
         self,

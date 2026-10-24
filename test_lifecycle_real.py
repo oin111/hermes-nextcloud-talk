@@ -332,6 +332,101 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 self.assertFalse(instance._is_acknowledged("room", message_id))
                 self.assertFalse(instance._inflight_message_ids.get("room"))
 
+    async def test_image_only_success_is_acked_and_not_replayed(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            image = Path(tmp) / "one.png"
+            image.write_bytes(b"png")
+            runs = []
+            uploads = []
+
+            async def handler(event):
+                runs.append(event.message_id)
+                return f"MEDIA:{image}"
+
+            async def send_file(*args, **kwargs):
+                uploads.append((args, kwargs))
+                return SendResult(success=True, message_id="image")
+
+            instance.set_message_handler(handler)
+            instance._send_file_attachment = send_file
+            inbound = {**_MESSAGE, "id": 28256}
+            await instance._handle_talk_message(inbound, "room")
+            await self.wait_for_background(instance)
+            self.assertEqual(len(uploads), 1, "must exercise real image delivery")
+            self.assertTrue(instance._is_acknowledged("room", 28256))
+            reloaded = self.make_adapter(tmp)
+            reloaded._load_cursors()
+            self.assertTrue(reloaded._is_acknowledged("room", 28256))
+            await instance._handle_talk_message(inbound, "room")
+            await self.wait_for_background(instance)
+            self.assertEqual(len(runs), 1)
+            self.assertEqual(len(uploads), 1)
+
+    async def test_image_batch_result_requires_every_send_to_succeed(self):
+        for outcomes in ((True, True), (False, True), (True, False), (False, False), ()):
+            with self.subTest(outcomes=outcomes), tempfile.TemporaryDirectory() as tmp:
+                instance = self.make_adapter(tmp)
+                pending = iter(outcomes)
+
+                async def send_image(**kwargs):
+                    return SendResult(success=next(pending))
+
+                instance.send_image = send_image
+                result = await instance.send_multiple_images(
+                    "room", [(f"https://example.invalid/{i}.png", "")
+                             for i in range(len(outcomes))]
+                )
+                self.assertIsInstance(result, SendResult)
+                self.assertEqual(result.success, bool(outcomes) and all(outcomes))
+
+    async def test_partial_image_batch_is_not_acked(self):
+        for text in ("", "text delivered\n"):
+            for broken in (SendResult(success=False, error="failed"), RuntimeError("failed")):
+                with self.subTest(text=bool(text), broken=type(broken).__name__), tempfile.TemporaryDirectory() as tmp:
+                    instance = self.make_adapter(tmp)
+                    images = [Path(tmp) / "first.png", Path(tmp) / "second.png"]
+                    for image in images:
+                        image.write_bytes(b"png")
+                    uploads = []
+
+                    async def send_file(*args, **kwargs):
+                        uploads.append(args)
+                        if len(uploads) == 1:
+                            if isinstance(broken, Exception):
+                                raise broken
+                            return broken
+                        return SendResult(success=True, message_id="second")
+
+                    instance._send_file_attachment = send_file
+                    instance.send = lambda **kwargs: asyncio.sleep(
+                        0, result=SendResult(success=True, message_id="text")
+                    )
+                    instance.set_message_handler(lambda event: asyncio.sleep(
+                        0, result=text + "\n".join(f"MEDIA:{image}" for image in images)
+                    ))
+                    await instance._handle_talk_message({**_MESSAGE, "id": 28256}, "room")
+                    await self.wait_for_background(instance)
+                    self.assertEqual(len(uploads), 2)
+                    self.assertFalse(instance._is_acknowledged("room", 28256))
+
+    async def test_cancelled_image_batch_stops_before_next_send(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            calls = []
+
+            async def send_image(**kwargs):
+                calls.append(kwargs)
+                raise asyncio.CancelledError()
+
+            instance.send_image = send_image
+            with self.assertRaises(asyncio.CancelledError):
+                await instance.send_multiple_images(
+                    "room", [("https://example.invalid/one.png", ""),
+                             ("https://example.invalid/two.png", "")]
+                )
+            self.assertEqual(len(calls), 1)
+
     async def test_media_only_document_success_and_failure_gate_ack(self):
         with tempfile.TemporaryDirectory() as tmp:
             instance = self.make_adapter(tmp)

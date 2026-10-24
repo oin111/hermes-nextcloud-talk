@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.19] - 2026-10-24 (UTC)
+
+### Fixed
+
+- Return an explicit delivery result from image batches, so successful image-only
+  replies are acknowledged instead of running the original command again. A partial
+  batch failure remains a failure even if another image or the text was delivered.
+- Propagate image-batch cancellation instead of swallowing it and sending later images.
+- Add real-Hermes regressions for image-only delivery, persisted acknowledgement,
+  replay suppression, partial failures, empty batches and cancellation.
+
 ## [0.1.18] - 2026-10-22 (UTC)
 
 ### Added

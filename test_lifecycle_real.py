@@ -537,7 +537,7 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             self.assertTrue(instance._is_acknowledged("room", 43))
             self.assertFalse(instance._inflight_message_ids.get("room"))
             self.assertEqual(instance._completion_watchdogs, {})
-            self.assertNotIn("nextcloud_talk_processing_task", calls[0].metadata)
+            self.assertNotIn("nextcloud_talk_processing_task", instance._event_local_state(calls[0]))
 
     async def test_watchdog_does_not_replay_event_held_in_busy_queue(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -630,11 +630,11 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             await instance._handle_talk_message({**_MESSAGE, "id": 49}, "room")
             queued_event, session_key = queued[-1]
             self.assertIs(instance._pending_messages[session_key], queued_event)
-            self.assertIs(queued_event.metadata.get(
+            self.assertIs(instance._event_local_state(queued_event).get(
                 "nextcloud_talk_completion_event"
-            ), instance._inflight_generations[next(
+            ), instance._event_local_state(instance._inflight_generations[next(
                 key for key in instance._inflight_generations if key[1] == 49
-            )].metadata["nextcloud_talk_completion_event"])
+            )])["nextcloud_talk_completion_event"])
 
             release_first.set()
             await self.wait_for_background(instance)
@@ -745,14 +745,14 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 source=source,
                 message_type=adapter.MessageType.TEXT,
                 message_id="910",
-                metadata={
-                    "nextcloud_talk_room_token": "room",
-                    "nextcloud_talk_message_id": 910,
-                    "nextcloud_talk_generation": key[2],
-                    "nextcloud_talk_handler_state": "success",
-                    "nextcloud_talk_text_delivery_required": False,
-                },
             )
+            event._nextcloud_talk_state = {
+                "nextcloud_talk_room_token": "room",
+                "nextcloud_talk_message_id": 910,
+                "nextcloud_talk_generation": key[2],
+                "nextcloud_talk_handler_state": "success",
+                "nextcloud_talk_text_delivery_required": False,
+            }
             instance._inflight_message_ids.setdefault("room", set()).add(910)
             instance._inflight_generations[key] = event
             instance._generation_outcomes[key] = {}
@@ -807,7 +807,7 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 instance._generation_outcomes[key].get("delivery_succeeded"), True
             )
             self.assertEqual(
-                event.metadata.get("nextcloud_talk_handler_state"), "success"
+                instance._event_local_state(event).get("nextcloud_talk_handler_state"), "success"
             )
 
             await instance.disconnect()
@@ -1208,12 +1208,12 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 source=source,
                 message_type=adapter.MessageType.TEXT,
                 message_id="100",
-                metadata={
-                    "nextcloud_talk_room_token": "room",
-                    "nextcloud_talk_message_id": 100,
-                    "nextcloud_talk_generation": 1,
-                },
             )
+            original._nextcloud_talk_state = {
+                "nextcloud_talk_room_token": "room",
+                "nextcloud_talk_message_id": 100,
+                "nextcloud_talk_generation": 1,
+            }
             instance._inflight_message_ids["room"] = {100}
             instance._current_generations[("room", 100)] = 1
             instance._inflight_generations[generation_key] = original
@@ -1279,12 +1279,12 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 source=alice_source,
                 message_type=adapter.MessageType.TEXT,
                 message_id="100",
-                metadata={
-                    "nextcloud_talk_room_token": "room",
-                    "nextcloud_talk_message_id": 100,
-                    "nextcloud_talk_generation": 1,
-                },
             )
+            original._nextcloud_talk_state = {
+                "nextcloud_talk_room_token": "room",
+                "nextcloud_talk_message_id": 100,
+                "nextcloud_talk_generation": 1,
+            }
             instance._inflight_message_ids["room"] = {100}
             instance._current_generations[("room", 100)] = 1
             instance._inflight_generations[("room", 100, 1)] = original
@@ -1365,12 +1365,12 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 source=source,
                 message_type=adapter.MessageType.TEXT,
                 message_id="100",
-                metadata={
-                    "nextcloud_talk_room_token": "room",
-                    "nextcloud_talk_message_id": 100,
-                    "nextcloud_talk_generation": 1,
-                },
             )
+            original._nextcloud_talk_state = {
+                "nextcloud_talk_room_token": "room",
+                "nextcloud_talk_message_id": 100,
+                "nextcloud_talk_generation": 1,
+            }
             instance._inflight_message_ids["room"] = {100}
             instance._current_generations[("room", 100)] = 1
             instance._inflight_generations[("room", 100, 1)] = original
@@ -1609,14 +1609,14 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 instance.set_busy_session_handler(defer)
                 message = {**_MESSAGE, "id": 882}
                 await instance._handle_talk_message(message, "room")
-                generation_a = captured[-1].metadata["nextcloud_talk_generation"]
+                generation_a = instance._event_local_state(captured[-1])["nextcloud_talk_generation"]
                 instance._pending_messages.pop(key, None)
                 await asyncio.sleep(0.05)
                 self.assertFalse(instance._inflight_message_ids.get("room"))
 
                 await instance._handle_talk_message(message, "room")
                 event_b = captured[-1]
-                generation_b = event_b.metadata["nextcloud_talk_generation"]
+                generation_b = instance._event_local_state(event_b)["nextcloud_talk_generation"]
                 self.assertNotEqual(generation_a, generation_b)
                 watchdog_b = instance._completion_watchdogs[("room", 882, generation_b)]
 
@@ -1663,7 +1663,7 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
             while not captured:
                 await asyncio.sleep(0)
             watchdog = next(iter(instance._completion_watchdogs.values()))
-            completion_event = captured[0].metadata["nextcloud_talk_completion_event"]
+            completion_event = instance._event_local_state(captured[0])["nextcloud_talk_completion_event"]
 
             await instance.disconnect()
             with self.assertRaisesRegex(RuntimeError, "processing failed"):

@@ -77,7 +77,9 @@ class _Base(unittest.IsolatedAsyncioTestCase):
             return None
 
         instance.set_message_handler(handler)
-        with patch.object(instance, "handle_message", side_effect=lambda e: seen.append(e) or asyncio.sleep(0)):
+        async def capture(event):
+            seen.append(event)
+        with patch.object(instance, "handle_message", side_effect=capture):
             await instance._handle_talk_message(msg, room)
         self.assertEqual(len(seen), 1)
         return seen[0]
@@ -96,7 +98,7 @@ class InboundThreadTests(_Base):
             event = await self.capture_event(instance, _thread_msg(105, 100, title="Research"))
             self.assertEqual(event.source.thread_id, "100")
             self.assertEqual(event.source.chat_topic, "Research")
-            self.assertEqual(event.metadata.get("nextcloud_talk_thread_id"), 100)
+            self.assertEqual(instance._event_local_state(event).get("nextcloud_talk_thread_id"), 100)
             # The implicit parent (thread root) is not a user-chosen quote.
             self.assertIsNone(getattr(event, "reply_to_message_id", None))
 

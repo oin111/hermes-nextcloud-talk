@@ -159,7 +159,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.19"
+_RELEASED_VERSION = "0.1.20"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -2209,7 +2209,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     def set_message_handler(self, handler) -> None:
         """Record inline control-handler outcomes hidden by Base's void API."""
         async def tracked(event: MessageEvent):
-            metadata = getattr(event, "metadata", None)
+            metadata = NextcloudTalkAdapter._event_local_state(event)
             if isinstance(metadata, dict):
                 metadata["nextcloud_talk_handler_state"] = "running"
                 metadata["nextcloud_talk_processing_task"] = asyncio.current_task()
@@ -2252,7 +2252,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     async def _run_processing_hook(self, hook_name: str, *args: Any, **kwargs: Any) -> None:
         if hook_name == "on_processing_complete" and len(args) >= 2:
             event, outcome = args[0], args[1]
-            metadata = getattr(event, "metadata", None)
+            metadata = NextcloudTalkAdapter._event_local_state(event)
             if isinstance(metadata, dict):
                 metadata["nextcloud_talk_terminal_outcome"] = getattr(
                     outcome, "value", str(outcome)
@@ -2279,7 +2279,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             tracked = None
         else:
             async def tracked(event: MessageEvent, session_key: str):
-                metadata = getattr(event, "metadata", None)
+                metadata = NextcloudTalkAdapter._event_local_state(event)
                 if isinstance(metadata, dict):
                     metadata["nextcloud_talk_busy_session_key"] = session_key
                 try:
@@ -2359,7 +2359,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     async def on_processing_start(self, event: MessageEvent) -> None:
         await super().on_processing_start(event)
-        metadata = getattr(event, "metadata", None)
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         if not isinstance(metadata, dict) or metadata.get("nextcloud_talk_message_id") is None:
             return  # only real Talk messages get a status reaction
         chat_id = getattr(event.source, "chat_id", None)
@@ -2665,7 +2665,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             ProcessingOutcome.FAILURE, "value", str(ProcessingOutcome.FAILURE)
         )
         for event in list(self._inflight_generations.values()):
-            metadata = getattr(event, "metadata", None) or {}
+            metadata = NextcloudTalkAdapter._event_local_state(event)
             metadata["nextcloud_talk_processing_outcome"] = failure_value
             completion_event = metadata.get("nextcloud_talk_completion_event")
             if isinstance(completion_event, asyncio.Event):
@@ -3013,8 +3013,20 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         return self._current_generations.get((room_token, numeric_id)) == generation
 
     @staticmethod
+    def _event_local_state(event: MessageEvent) -> Dict[str, Any]:
+        """Exact-event, process-local lifecycle state; never native wire metadata.
+
+        MessageEvent is an extensible (non-slotted) dataclass on supported cores.
+        Native admission freezes/reconstructs it without private attributes. A
+        reconstructed input must not inherit a live task, waiter or generation;
+        its durable ownership/replay remains the core's responsibility.
+        """
+        state = getattr(event, "_nextcloud_talk_state", None)
+        return state if isinstance(state, dict) else {}
+
+    @staticmethod
     def _event_generation_key(event: MessageEvent) -> Optional[tuple[str, int, int]]:
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         room_token = metadata.get("nextcloud_talk_room_token")
         numeric_id = metadata.get("nextcloud_talk_message_id")
         generation = metadata.get("nextcloud_talk_generation")
@@ -4026,7 +4038,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         for state in getattr(self, "_text_debounce", {}).values():
             if getattr(state, "event", None) is event:
                 return True
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         session_key = metadata.get("nextcloud_talk_busy_session_key")
         runner = getattr(self, "gateway_runner", None)
         peek = getattr(runner, "_peek_session_state", None)
@@ -4745,7 +4757,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._inflight_generations.pop(key, None)
         self._generation_outcomes.pop(key, None)
         self._inflight_message_ids.get(room_token, set()).discard(numeric_id)
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         metadata.pop("nextcloud_talk_processing_task", None)
         metadata["nextcloud_talk_processing_outcome"] = getattr(
             ProcessingOutcome.FAILURE, "value", str(ProcessingOutcome.FAILURE)
@@ -4761,7 +4773,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         """Return true only when handler and required delivery both completed."""
         if not self._generation_is_current(key):
             return False
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         if metadata.get("nextcloud_talk_handler_state") != "success":
             return False
         state = self._generation_outcomes.get(key, {})
@@ -4792,7 +4804,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 await asyncio.sleep(self.processing_timeout)
                 if not self._generation_is_current(key):
                     return
-                metadata = getattr(event, "metadata", None) or {}
+                metadata = NextcloudTalkAdapter._event_local_state(event)
                 processing_task = metadata.get("nextcloud_talk_processing_task")
                 if isinstance(processing_task, asyncio.Task) and not processing_task.done():
                     logger.info(
@@ -4899,7 +4911,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         try:
             await self.handle_message(event)
         except BaseException:
-            metadata = getattr(event, "metadata", None) or {}
+            metadata = NextcloudTalkAdapter._event_local_state(event)
             if metadata.get("nextcloud_talk_processing_task") is dispatch_task:
                 # Core already ran the command inline; never run it again.
                 self._remember_settled_command(room_token, numeric_id)
@@ -4913,7 +4925,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 if owner_task is not None and owner_task in expected:
                     # Core really cancelled the turn for this command.
                     self._user_stopped_tasks.add(owner_task)
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         if metadata.get("nextcloud_talk_processing_task") is dispatch_task:
             # Handled inline: settle exactly once, never replay the command.
             if not self._generation_is_current(key):
@@ -4972,7 +4984,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         key = (room_token, numeric_id, generation)
         if not self._generation_is_current(key):
             return
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         if "nextcloud_talk_processing_outcome" in metadata:
             return
         background_after = set(getattr(self, "_background_tasks", set()))
@@ -5372,15 +5384,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             media_urls=media_urls,
             media_types=media_types,
             timestamp=self._timestamp_from_message(msg),
-            metadata={
-                "nextcloud_talk_room_token": room_token,
-                "nextcloud_talk_message_id": numeric_id,
-                "nextcloud_talk_generation": generation,
-                "nextcloud_talk_completion_event": completion_event,
-                **({"nextcloud_talk_thread_id": thread_id} if thread_id is not None else {}),
-            },
             **reply_fields,
         )
+        event._nextcloud_talk_state = {
+            "nextcloud_talk_room_token": room_token,
+            "nextcloud_talk_message_id": numeric_id,
+            "nextcloud_talk_generation": generation,
+            "nextcloud_talk_completion_event": completion_event,
+            **({"nextcloud_talk_thread_id": thread_id} if thread_id is not None else {}),
+        }
         if numeric_id is not None:
             # Show the sender that the bot has picked the message up.
             self._queue_read_marker(room_token, numeric_id)
@@ -5433,7 +5445,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             expected_success = getattr(
                 ProcessingOutcome.SUCCESS, "value", str(ProcessingOutcome.SUCCESS)
             )
-            if event.metadata.get("nextcloud_talk_processing_outcome") != expected_success:
+            if self._event_local_state(event).get("nextcloud_talk_processing_outcome") != expected_success:
                 raise _OutcomeAlreadyRecorded("Nextcloud Talk startup message processing failed")
 
     async def on_processing_complete(self, event: MessageEvent, outcome: ProcessingOutcome) -> None:
@@ -5443,7 +5455,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         if key is None or not self._generation_is_current(key):
             return
         room_token, numeric_id, _generation = key
-        metadata = getattr(event, "metadata", None) or {}
+        metadata = NextcloudTalkAdapter._event_local_state(event)
         hook_error: Optional[BaseException] = None
         effective_outcome = outcome
         generation_state = self._generation_outcomes.get(key, {})

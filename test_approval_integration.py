@@ -158,6 +158,111 @@ class ApprovalPollIntegrationTests(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(resolve.call_count, 1)
             self.assertTrue(instance._is_acknowledged("room", 101))
 
+    async def test_failed_ack_then_restart_cannot_consume_two_fifo_requests(self):
+        for failure in ("write", "replace", "file_fsync", "directory_fsync_after_replace"):
+            with self.subTest(failure=failure), tempfile.TemporaryDirectory() as tmp:
+                instance = self.make_adapter(tmp)
+                instance._client = _Client([])
+                self.register(instance)
+                pending = ["first", "second"]
+                applied = []
+
+                def resolve(session, choice, request_id=None):
+                    applied.append(pending.pop(0))
+                    return 1
+
+                # Fail the actual ACK store, not the handler's commit wrapper.
+                target = {"write": "json.dump", "replace": "os.replace"}.get(failure, "os.fsync")
+                real_fsync = adapter.os.fsync
+                sync_calls = 0
+
+                def fail_store(*args, **kwargs):
+                    nonlocal sync_calls
+                    if target == "os.fsync":
+                        sync_calls += 1
+                        fail_at = 1 if failure == "file_fsync" else 3
+                        if sync_calls != fail_at:
+                            return real_fsync(*args, **kwargs)
+                    raise OSError("disk")
+
+                with patch("tools.approval.resolve_gateway_approval", side_effect=resolve):
+                    module_name, method = target.split(".")
+                    with patch.object(getattr(adapter, module_name), method, side_effect=fail_store):
+                        with self.assertRaises(adapter.CursorCacheError):
+                            await instance._handle_talk_message(self.row(), "room")
+                    self.assertEqual(applied, [], "approval escaped before its durable ACK")
+                    self.assertEqual(pending, ["first", "second"])
+                    # Lose all process-local state, then recreate the card as a caller may.
+                    restarted = self.make_adapter(tmp)
+                    restarted._client = _Client([])
+                    restarted._load_cursors()
+                    self.register(restarted)
+                    await restarted._handle_talk_message(self.row(), "room")
+                    restarted._settled_commands.clear()  # cache eviction is not protection
+                    again = self.make_adapter(tmp)
+                    again._client = _Client([])
+                    again._load_cursors()
+                    self.register(again)
+                    await again._handle_talk_message(self.row(), "room")
+                self.assertEqual(applied, ["first"])
+                self.assertEqual(pending, ["second"])
+                self.assertTrue(again._is_acknowledged("room", 101))
+
+    async def test_crash_after_durable_ack_never_resolves_on_restart(self):
+        class Crash(BaseException):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance._client = _Client([])
+            self.register(instance)
+            pending = ["first", "second"]
+
+            def crash(session, choice, request_id=None):
+                reloaded = self.make_adapter(tmp)
+                reloaded._load_cursors()
+                self.assertTrue(reloaded._is_acknowledged("room", 101))
+                raise Crash()
+
+            with patch("tools.approval.resolve_gateway_approval", side_effect=crash):
+                with self.assertRaises(Crash):
+                    await instance._handle_talk_message(self.row(), "room")
+            restarted = self.make_adapter(tmp)
+            restarted._client = _Client([])
+            restarted._load_cursors()
+            self.register(restarted)
+
+            def resolve(session, choice, request_id=None):
+                pending.pop(0)
+                return 1
+
+            with patch("tools.approval.resolve_gateway_approval", side_effect=resolve) as resolver:
+                await restarted._handle_talk_message(self.row(), "room")
+                resolver.assert_not_called()
+            self.assertEqual(pending, ["first", "second"])
+
+    async def test_resolver_partial_failure_is_not_retried_after_restart(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance._client = _Client([])
+            self.register(instance)
+            pending = ["first", "second"]
+
+            def resolve_then_raise(session, choice, request_id=None):
+                pending.pop(0)
+                raise RuntimeError("failure after core side effect")
+
+            with patch("tools.approval.resolve_gateway_approval", side_effect=resolve_then_raise):
+                await instance._handle_talk_message(self.row(), "room")
+            restarted = self.make_adapter(tmp)
+            restarted._client = _Client([])
+            restarted._load_cursors()
+            self.register(restarted)
+            with patch("tools.approval.resolve_gateway_approval", side_effect=resolve_then_raise) as resolver:
+                await restarted._handle_talk_message(self.row(), "room")
+                resolver.assert_not_called()
+            self.assertEqual(pending, ["second"])
+
     async def send_race_card(self, instance):
         # Older CI pins have no shared builder; still exercise the adapter hook
         # and real send transport there, rather than skipping lifecycle coverage.

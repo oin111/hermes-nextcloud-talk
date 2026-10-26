@@ -51,9 +51,14 @@ approve. Cards are process-local and cleared on disconnect.
 expiry, otherwise Hermes `approvals.timeout` is used, then a 3600-second fallback.
 This does not extend the core's actual approval deadline. Expired cards are pruned
 on the existing room-poll path. A tap resolving no pending request is logged at WARNING.
-After an ACK-store failure, in-process replay retries only the ACK through the same
-bounded settlement cache as slash commands; a restart or cache eviction before ACK
-persistence can still replay an unbound tap against the then-current FIFO head.
+Approval reactions durably consume their exact event ID in the existing prefix ACK
+ledger **before** calling the Hermes resolver. If ACK storage fails, no approval is
+applied; replay may retry once storage recovers. Restart and settlement-cache eviction
+cannot reapply a durably consumed tap to a later FIFO request. This is fail-closed
+at-most-once handling, not a transaction with the core queue: a crash after the ACK
+but before resolution, or a resolver exception, can consume the tap without applying
+the choice. Check the pending request and submit a fresh reaction (remove/re-add it)
+or use the normal approval command; the old event is never retried.
 
 ### Runtime
 

@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [Unreleased]
+
+### Fixed
+
+- Durably consume authorized approval-reaction event IDs before resolving Hermes
+  approvals. Storage failures cannot apply a choice before its ACK, and restart or
+  settlement-cache eviction cannot replay it against the next FIFO request.
+- Document the fail-closed crash window: an ACKed tap may be lost before resolution,
+  requiring a fresh user action rather than risking duplicate approval. Add storage
+  failure, restart, multiple-pending-request and resolver-failure regressions.
+
 ## [0.1.21] - 2026-10-24 (UTC)
 
 ### Fixed

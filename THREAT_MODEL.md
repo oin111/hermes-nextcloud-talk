@@ -95,9 +95,12 @@ Report any way to break one of these:
   Hermes cancelled for the owner's stop/reset command is acknowledged, while one whose stop
   command failed stays retryable.
   Native approval-card reactions also pass the hold under the separate room/allowlist
-  policy above, not the slash command's owner policy. Their consumed IDs use the same
-  prefix ACK ledger and bounded in-process settlement cache; restart or eviction before
-  an ACK is stored can replay an unbound tap against a later FIFO request.
+  policy above, not the slash command's owner policy. Their exact event IDs are durably
+  consumed in the prefix ACK ledger before core resolution. ACK-store failure applies
+  no approval; replay after restart or cache eviction cannot reapply a consumed event.
+  This is an explicit fail-closed exception to outcome-before-ACK: a crash between
+  ACK and resolution, or a resolver exception, may lose a choice. A fresh user action
+  is required; there is no atomic transaction with the Hermes approval queue.
 - **Presentation calls are side effects only.** Status reactions and read markers are best
   effort and time-limited; their failure or delay must never change, delay, or duplicate a
   reply, and never change what is acknowledged.

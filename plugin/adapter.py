@@ -4300,8 +4300,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             self._commit_cursor(room_token, numeric_id)
             return True
         # Resolution is not idempotent: an unbound tap consumes the FIFO head.
-        # Reuse the bounded command-settlement cache if ACK persistence fails.
-        self._remember_settled_command(room_token, numeric_id)
+        # Consume the exact event durably BEFORE invoking core. If storage fails,
+        # propagate without resolving anything. A crash after the ACK may lose a
+        # choice, but replay must never apply it to another pending request.
+        # There is deliberately no await between the durable ACK and resolution.
+        self._commit_cursor(room_token, numeric_id)
         resolved_count = 0
         try:
             from tools.approval import resolve_gateway_approval
@@ -4351,8 +4354,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             # and retiring a card the user still needs is worse than leaving a stale-looking one.
             # Expiry is the only thing that retires a prompt — see the expiry branch above and
             # test_denials_when_gateway_has_nothing_pending_retire_expired_prompt_only.
-        self._commit_cursor(room_token, numeric_id)
-        self._settled_commands.pop((room_token, numeric_id), None)
+        # The event was already durably consumed before core resolution.
         return True
 
     def _session_has_blocking_approval(self, session_key: str) -> bool:

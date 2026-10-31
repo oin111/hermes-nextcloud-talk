@@ -2,6 +2,17 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.23] - 2026-10-31 (UTC)
+
+### Fixed
+
+- Native approval cards now notify in the default important-notifications mode,
+  rather than silently expiring unnoticed. Mark the outbound card as an approval
+  prompt while preserving thread routing and the caller's original metadata.
+- Add regressions for absent, empty and thread-bearing metadata, an explicitly
+  false approval marker, and progress messages remaining silent after a card.
+  Approval choices, authorization and configured timeout behavior are unchanged.
+
 ## [0.1.22] - 2026-10-26 (UTC)
 
 ### Fixed

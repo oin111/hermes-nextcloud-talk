@@ -108,6 +108,35 @@ class ApprovalReactionTestBase(unittest.IsolatedAsyncioTestCase):
 
 
 class SendExecApprovalSeedsReactionsTests(ApprovalReactionTestBase):
+    async def test_native_approval_notifies_without_mutating_caller_metadata(self):
+        for metadata in (None, {}, {"thread_id": "100", "requester_user_id": "owner"},
+                         {"is_approval_prompt": False, "_interim_send": True}):
+            with self.subTest(metadata=metadata):
+                instance = self.make_adapter()
+                instance.notifications = "important"
+                prompt = _approval_prompt()
+                prompt.metadata = metadata
+                original = dict(metadata) if metadata is not None else None
+                sent = []
+
+                async def send_message(room, text, **kwargs):
+                    sent.append((room, text, kwargs))
+                    return {"id": 4242}
+
+                instance._client.send_message = send_message
+                result = await self.seed_prompt(instance, prompt)
+                self.assertTrue(result.success)
+                self.assertEqual(len(sent), 1)
+                self.assertFalse(sent[0][2].get("silent", False),
+                                 "Native approval must notify in important mode")
+                if metadata and "thread_id" in metadata:
+                    self.assertEqual(str(sent[0][2]["thread_id"]), metadata["thread_id"])
+                self.assertEqual(prompt.metadata, original)
+                self.assertIs(prompt.metadata, metadata)
+                # Ordinary progress must remain silent after sending a prompt.
+                await instance.send("dm-room", "progress", metadata=metadata)
+                self.assertTrue(sent[-1][2].get("silent", False))
+
     async def test_seed_registers_prompt_and_all_choice_reactions(self):
         instance = self.make_adapter()
         result = await self.seed_prompt(instance)

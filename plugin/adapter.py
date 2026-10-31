@@ -159,7 +159,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.22"
+_RELEASED_VERSION = "0.1.23"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -4129,7 +4129,11 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         chat_id = str(prompt.chat_id or "")
         if not session_key or not chat_id:
             return SendResult(success=False, error="Approval prompt missing session or room")
-        result = await self.send(chat_id, prompt.text, metadata=prompt.metadata)
+        # Core's native-card path supplies thread metadata without the marker
+        # used by the text fallback. Approval cards must notify in important mode;
+        # copy metadata so the caller's later progress does not inherit this flag.
+        metadata = {**(prompt.metadata or {}), "is_approval_prompt": True}
+        result = await self.send(chat_id, prompt.text, metadata=metadata)
         if self._approval_lifecycle_generation is not generation:
             return SendResult(success=False, error="Approval lifecycle ended", message_id=result.message_id)
         if not result.success or not result.message_id:

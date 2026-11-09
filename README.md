@@ -198,7 +198,8 @@ Display names are deliberately **not** used for authorization: a display name ma
 change and need not be unique. The stable `actorId` is the authorization basis;
 `actorDisplayName` is retained only for message attribution.
 
-To require a leading bot name/mention:
+To require a leading bot name/mention in group rooms (private one-to-one
+conversations remain usable without a mention):
 
 ```env
 NEXTCLOUD_TALK_REQUIRE_MENTION=true

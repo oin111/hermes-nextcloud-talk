@@ -4645,7 +4645,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             for param in file_refs.values()
         ):
             return None
-        stripped = self._strip_bot_mention(text)
+        stripped = self._strip_bot_mention(text, chat_type=getattr(source, "chat_type", "group"))
         if not stripped or not stripped.startswith("/"):
             return None
         try:
@@ -5344,8 +5344,8 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                 else:
                     text = text.replace("{" + key + "}", fname)
 
-        text = self._strip_bot_mention(text)
-        if self.require_mention and not text:
+        text = self._strip_bot_mention(text, chat_type=chat_type)
+        if self.require_mention and chat_type != "dm" and not text:
             self._commit_cursor(room_token, numeric_id)
             return
 
@@ -5539,10 +5539,12 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         allowed = self.group_allowed_users if chat_type in {"group", "forum", "channel"} else self.allowed_users
         return "*" in allowed or stable_id in allowed
 
-    def _strip_bot_mention(self, text: str) -> str:
+    def _strip_bot_mention(self, text: str, *, chat_type: str = "group") -> str:
+        """Require a leading bot mention only in non-private rooms."""
         raw = text.strip()
+        require_mention = self.require_mention and chat_type != "dm"
         if not self.bot_name:
-            return raw if not self.require_mention else ""
+            return raw if not require_mention else ""
         escaped = re.escape(self.bot_name.strip())
         patterns = [
             rf"^@?{escaped}[:,\s]+(.+)$",
@@ -5552,7 +5554,7 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
             match = re.match(pattern, raw, flags=re.IGNORECASE | re.DOTALL)
             if match:
                 return match.group(1).strip()
-        return "" if self.require_mention else raw
+        return "" if require_mention else raw
 
     @staticmethod
     def _timestamp_from_message(msg: Dict[str, Any]) -> datetime:

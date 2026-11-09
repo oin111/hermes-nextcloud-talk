@@ -2,6 +2,15 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.24] - 2026-11-09 (UTC)
+
+### Fixed
+
+- Require a leading bot mention only in group rooms when mention gating is enabled;
+  private one-to-one conversations remain usable without an explicit mention.
+- Preserve addressed-message stripping and private slash-command handling while
+  a session is busy. Add regression coverage to the explicit CI test lists.
+
 ## [0.1.23] - 2026-10-31 (UTC)
 
 ### Fixed

@@ -2,6 +2,47 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.25] - 2026-11-12 (UTC)
+
+### Added
+
+- Fetch bounded, preceding Talk discussion on addressed group questions when
+  mention gating is enabled: up to 50 eligible messages within 24 hours, four
+  backward pages, a 3-second async wait and a 16-KiB added-text budget by default.
+- Filter stable actor authorization and exact threads; quote authors and UTC
+  timestamps as untrusted user-level data. Deduplicate ordinary addressed IDs
+  from trusted persisted columns and prior quotes using opaque HMAC-SHA256
+  receipts bound to routing scope, session, trigger ID and exact record. Forged
+  JSON or exact receipt replay under another turn cannot suppress context; raw
+  endpoint/account/session bookkeeping is not added to model input.
+- Resolve real SessionStore routes before dedup, including suspended-session
+  rotation. Offload routing and bounded read-only transcript/receipt scans;
+  include local I/O in the response deadline. Keep one outstanding task per
+  adapter until its underlying worker finishes after timeout; busy/failed reads
+  preserve the question, not a partial dedup result. No core or native codec edits.
+- Require explicit ordinary comment history rows and string display names; reject
+  deleted/system/command/missing-type rows even with an empty system marker.
+  Document store/schema capability checks, scan limits and retention boundaries.
+- Select plugin-local legacy store routing/database and authorization-signature
+  compatibility by capability; reject reroute cycles without weakening exact
+  thread filtering or profile scope. No core methods are injected.
+- Add scoped opt-out, byte-budget and timeout settings, real-Base intake tests,
+  and explicit CI coverage. Backward history reads explicitly disable server
+  read-marker updates; no history attachments or presentation effects are run.
+
+### Fixed
+
+- Treat raw leading slash commands as explicitly addressed in mention-gated
+  groups while retaining sender and core command authorization.
+- Consume an authorized live `/restart` exact message ID durably before core
+  handler entry, closing restart-before-reply replay. Missing authorization
+  capabilities and persistence failures prevent handler entry. This is
+  fail-closed at-most-once dispatch: later refusal, crash or restart failure
+  can consume without execution and requires a fresh command; other commands
+  keep completion-based ACKs.
+- Add real-core restart, interrupted acknowledgement, durable cursor reload,
+  storage-fault and slash-intake regressions to every explicit CI test list.
+
 ## [0.1.24] - 2026-11-09 (UTC)
 
 ### Fixed

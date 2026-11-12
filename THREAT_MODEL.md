@@ -4,6 +4,18 @@ This file tells reviewers (people and automated scanners) what this plugin defen
 are hostile, what is out of scope, and how to rate findings. It describes the code as released;
 if the code and this file disagree, report the disagreement.
 
+## Restart consumption exception
+
+For an exact live `/restart` only, the adapter consults the installed core's sender
+and slash-access authorization before persisting its exact upstream ACK and then
+entering the unchanged handler. Persistence failure or unavailable authorization
+capabilities prevent handler entry. Core admission and command dispatch remain in
+force; denial does not take the privileged preconsumption path. This deliberately
+trades retry availability for at-most-once dispatch: a post-ACK crash, later admission
+refusal, hook rewrite/refusal, or restart failure needs a fresh user command. It is
+not an exactly-once guarantee. Other commands ACK on normal completion, and quoted
+history is never command input. No cursor schema or floor rule is changed.
+
 ## What the plugin is
 
 A Hermes Gateway platform adapter. It runs inside the gateway process with the gateway user's
@@ -11,6 +23,55 @@ rights, logs in to one Nextcloud server as one Nextcloud account (the bot), long
 chat API of the rooms it serves, turns each accepted message into a Hermes turn, and posts the
 answer back (text, files via WebDAV upload and a Talk share). There is no listening socket: all
 traffic is outbound to the configured Nextcloud origin.
+
+## Mention-history context boundary
+
+Mention-gated group questions add an on-demand input: preceding Talk text. Rows
+are hostile, including author labels, timestamps, thread markers and text that
+looks like commands or system instructions. They must pass the existing stable
+actor allowlist and any explicit denial from the core authorization callback.
+Only the exact room and thread are projected. Own-bot/system/invalid/future rows
+are excluded. Fetch anchors decrease strictly from the trigger ID; four pages,
+50 eligible messages, 24-hour age, an added-quote byte budget and an async wait
+limit bound enrichment. Failure must preserve the actual addressed question and
+must not advance its ACK early or consume history for a failed handoff.
+
+History is JSON-quoted user-level participant data. It must not enter channel or
+system prompts, command/approval dispatch, synthetic turns, media downloads,
+read-marker updates, or cursor writes. The trigger remains the real request.
+Passive chatter is not separately persisted; included quotes are retained only
+as part of the ordinary addressed-turn transcript and can reach its model
+provider. Restrict allowed participants and retain normal tool approvals.
+
+Ordinary addressed IDs are read from trusted persisted platform-ID columns, never
+from participant text. Included quote records require HMAC-SHA256 receipts bound
+to exact record + owning scope + session ID + trusted trigger ID. The configured
+strong Talk app password keys domain-separated receipts; no new secret file or
+inclusion ledger is written. Forged JSON, tampered records and replay of a valid
+receipt in a different platform turn must not suppress context. No raw internal
+endpoint/account/session scope is model-visible. No arbitrary MessageEvent
+metadata or relaxation of the native codec is permitted.
+
+Resolve `get_or_create_session(..., touch_activity=False)` before deduplication;
+`peek_session_id` alone is not evidence of the next session after suspension.
+Use only explicit ordinary comment rows with string display names, independent
+of the system-message flag. Existing busy-room ownership prevents fetching
+followups before the preceding turn has persisted. Reset/new sessions start
+fresh. Retained-transcript dedup is not an independent exactly-once ledger:
+compaction, rewind, edits, credential rotation and pre-persistence crashes can
+restore eligibility. Concurrent core resets/routing are not an atomic plugin
+transaction.
+
+All local routing/read/receipt-scan work is offloaded under the same response
+deadline as network waits. Because the public loader is unbounded, optional
+integration uses a separate read-only connection to the resolved owning SessionDB,
+with SQL progress checks and 50-ms lock timeout: 512 active user rows, 64 KiB each,
+1 MiB total. Unsupported runtime/schema, pending writes, overflow or failures
+must skip enrichment, not deduplicate using partial evidence. One shielded task
+per adapter retains its permit after timeout until its thread/HTTP operation
+actually finishes: no unbounded worker replacements or per-request pools. A
+stalled OS read is not forcibly interruptible, but must not block the event loop
+or delay dispatch of the original question. Normal completion still owns ACKs.
 
 ## Assets
 

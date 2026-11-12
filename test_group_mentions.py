@@ -35,4 +35,5 @@ class GroupMentionTests(_Base):
             instance = self.make_adapter(tmp)
             instance.require_mention = True
             self.assertEqual(instance._strip_bot_mention('/status', chat_type='dm'), '/status')
-            self.assertEqual(instance._strip_bot_mention('/status', chat_type='group'), '')
+            # Slash commands address the gateway explicitly in either scope.
+            self.assertEqual(instance._strip_bot_mention('/status', chat_type='group'), '/status')

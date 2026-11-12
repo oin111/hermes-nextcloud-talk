@@ -4,6 +4,28 @@ A native [Hermes Agent](https://github.com/NousResearch/hermes-agent) Gateway pl
 
 It connects Hermes directly to Talk through the Spreed OCS API. It does **not** require a public webhook endpoint, a separate bridge service, or changes to Hermes core.
 
+## Slash commands and restart crash semantics
+
+A raw leading slash-command token bypasses `require_mention`; ambient group prose
+still requires the configured leading bot mention. Sender allowlists and Hermes'
+command authorization remain authoritative. Commands in fetched discussion history
+remain quoted participant data and never pass through command intake.
+
+`/restart` is the sole command-specific ACK exception: immediately before entering
+the normal core handler, the adapter checks the core's sender authorization and
+slash-access policy and durably consumes the exact Talk message ID. Persistence
+failure prevents handler entry. Missing core authorization capabilities fail closed.
+Denied commands stay on the normal core refusal/completion path, without privileged
+preconsumption. All other slash commands retain completion-based ACKs.
+
+This is **fail-closed at-most-once**, not exactly-once or guaranteed restart:
+a crash after consumption, a later core admission/hook refusal, or a restart failure
+can consume the request without restarting or delivering the acknowledgement. Send
+a fresh `/restart` in that case; never rewind the live cursor to retry it. Core still
+runs normal admission and dispatch, so preconsumption does not grant command access.
+No core code is modified. Existing cursor format and mention-history behavior remain
+unchanged.
+
 ## Features
 
 - Native `nextcloud_talk` platform inside Hermes Gateway.
@@ -205,6 +227,85 @@ conversations remain usable without a mention):
 NEXTCLOUD_TALK_REQUIRE_MENTION=true
 NEXTCLOUD_TALK_BOT_NAME=Hermes
 ```
+
+### Mention-triggered discussion context
+
+With `NEXTCLOUD_TALK_REQUIRE_MENTION=true`, unaddressed group chatter remains
+silent: no Hermes turn and no history fetch. An addressed ordinary question can
+include preceding discussion fetched on demand from Talk; DMs, slash-command
+requests and mention-gating-disabled rooms are unchanged.
+
+| Environment setting | `extra` key | Default / bounds |
+|---|---|---|
+| `NEXTCLOUD_TALK_MENTION_HISTORY` | `mention_history` | `true`; set `false` to disable enrichment |
+| `NEXTCLOUD_TALK_MENTION_HISTORY_MAX_BYTES` | `mention_history_max_bytes` | `16384`; clamped to 0–65536 UTF-8 bytes |
+| `NEXTCLOUD_TALK_MENTION_HISTORY_TIMEOUT` | `mention_history_timeout` | `3` seconds total async wait; clamped to 0.01–10 |
+
+These settings use the owning profile's scoped configuration readers (explicit
+profile environment value, then its YAML `extra`, then default). History is
+strictly before the triggering message ID, limited to the newest **50 eligible
+messages from the past 24 hours**, within at most **4 pages of 50** (or the
+configured smaller polling-page limit). Sparse threads or authorization filtering
+can yield fewer messages. Page anchors strictly decrease; repeats cannot loop.
+The byte limit covers the entire added quote, including author/UTC timestamp/ID
+metadata and JSON escaping, not the current request. Oversized individual records
+are omitted rather than cut into misleading fragments. Eligible quotes retain
+message-ID order, stable actor IDs, display names and UTC timestamps.
+
+Only currently authorized stable users/guests in that room and exact thread are
+eligible. Only explicit `comment` rows with string author labels are accepted;
+command, deleted, system, missing/unknown-type, malformed and future rows are
+excluded. The core's registered authorization callback can additionally deny a participant.
+History is text only: no attachment downloads, reactions, read markers, cursor
+updates, or synthetic participant turns. It is JSON-quoted **untrusted participant
+data**, never a system/channel prompt or a command; the current question remains
+the actual request at the start of the user event. Quoting is not a guarantee
+against model prompt injection: use restrictive allowlists and tool approvals.
+
+No passive-history cache or separate inclusion ledger is written. Included
+quotes become part of the normal addressed-turn transcript, with its usual
+retention and model-provider disclosure; the 24-hour selection window does not
+expire text already retained by Hermes. The adapter resolves the real session
+with `get_or_create_session(..., touch_activity=False)` before deduplication,
+including a suspended session's replacement, rather than peeking at a stale route.
+Ordinary user platform IDs come from trusted persisted database columns, not
+participant prose. Prior quotes count only with an authenticated receipt bound
+to the server/account, core profile/room/thread/participant key, session ID,
+trigger's trusted platform ID and exact quoted record. A copied valid receipt in
+a different participant turn is not evidence. Receipts use domain-separated
+HMAC-SHA256 with the configured Talk app password; use a strong app password.
+Only the opaque MAC is model-visible: no endpoint, account or routing/session
+scope is added. No native event metadata fields or core codec changes are needed.
+Failed handoff before persistence consumes nothing. Busy room followups do not
+fetch ahead of the active turn's persistence. Reset/new transcripts start fresh.
+
+Local routing and transcript scanning run off the event loop under the same
+wall-clock deadline as history reads. Since `load_transcript` has no bounded-read
+API, the plugin uses the resolved owning SessionDB's path and content decoder,
+with a separate **read-only SQLite connection**, a 50-ms lock timeout and a
+SQL progress deadline. It accepts at most 512 active user rows, 64 KiB per row
+and 1 MiB total; overflow or an unsupported store/schema skips enrichment
+rather than deduplicating from an incomplete scan. This is an optional,
+capability-dependent integration, not a change to the core database or codec.
+Modern stores use their reroute and owning-session database helpers. Legacy
+stores use a cycle-guarded local reroute map and their context-scoped database
+inside the context-preserving worker; cycles reject the entire snapshot. Core
+authorization receives a thread keyword only when its callable supports it;
+local exact-thread filtering remains mandatory on every runtime.
+At most one enrichment task/worker operation is outstanding per adapter; no
+per-request executor or waiting queue is created. The request falls back at its
+deadline, but the permit stays occupied until any already-running thread/HTTP
+operation actually finishes. Other questions continue without enrichment. A
+stalled OS read or HTTP worker cannot be forcibly killed by asyncio; it does not
+block the event loop or allow an unbounded series of replacement workers.
+
+**Limits:** this is retained-transcript deduplication, not an independent
+exactly-once delivery ledger. Compaction, rewind, edits, credential rotation, or
+a crash before persistence may restore quote eligibility. A reset concurrent
+with enrichment/handler routing is not an atomic plugin/core transaction.
+A missing session store, unreadable/oversized transcript, API failure, contention
+or timeout skips enrichment and preserves the unchanged question. The ordinary
+ACK/generation lifecycle remains authoritative for the question.
 
 ### Other settings
 
@@ -533,7 +634,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.24 targets the Python 3.11–3.13 compatibility CI matrix and Python 3.14 for the pinned modern native-admission core. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.25 targets the Python 3.11–3.13 compatibility CI matrix and Python 3.14 for the pinned modern native-admission core. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

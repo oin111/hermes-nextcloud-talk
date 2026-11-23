@@ -9,7 +9,11 @@ import adapter
 
 from gateway.config import GatewayConfig
 from gateway.session import SessionStore
-from hermes_state import SessionDB
+try:
+    from persistence_assembly import open_persistence, profile_scope
+except ImportError:  # Earlier supported Hermes pin uses SessionDB directly.
+    from hermes_state import SessionDB
+    open_persistence = None
 from test_threads import _Base, _msg
 
 
@@ -22,7 +26,8 @@ class MentionHistoryTests(_Base):
         instance = super().make_adapter(tmp, require_mention=True, **extra)
         store = SessionStore(Path(tmp) / 'sessions', GatewayConfig())
         db_home = self.enterContext(tempfile.TemporaryDirectory())
-        store._db = SessionDB(Path(db_home) / 'state.db')
+        store._db = (open_persistence(profile_scope(home=Path(db_home)), eager=True)
+                     if open_persistence else SessionDB(Path(db_home) / 'state.db'))
         self.addCleanup(store._db.close)
         instance.set_session_store(store)
         instance._client = type('Transport', (), {})()
@@ -71,6 +76,33 @@ class MentionHistoryTests(_Base):
             with self.assertRaises(ValueError):
                 instance._history_transcript_rows(
                     LegacyStore(), 'old-history-route', time.monotonic() + 1)
+
+    async def test_current_persistence_scope_and_structured_content(self):
+        if open_persistence is None:
+            self.skipTest('Persistence API not shipped by this core')
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            store = instance._session_store
+            source = instance.build_source(chat_id='room', chat_type='group', user_id='alice')
+            sid = store.get_or_create_session(source).session_id
+            store.append_to_transcript(sid, {'role': 'user', 'content': [{'text': 'OWNED'}], 'message_id': '5'})
+            with tempfile.TemporaryDirectory() as other:
+                foreign = open_persistence(profile_scope(home=Path(other)), eager=True)
+                self.addCleanup(foreign.close)
+                # The pinned profile is the only valid target, not the ambient
+                # home or another live persistence handle.
+                resolved, rows = instance._history_transcript_rows(store, sid, time.monotonic() + 2)
+                self.assertEqual((resolved, rows[0]['content']), (sid, [{'text': 'OWNED'}]))
+                original = store._db
+                try:
+                    store._db = foreign
+                    _, foreign_rows = instance._history_transcript_rows(store, sid, time.monotonic() + 2)
+                    self.assertEqual(foreign_rows, [])
+                    store._db = None
+                    with self.assertRaises(ValueError):
+                        instance._history_transcript_rows(store, 'unknown-session', time.monotonic() + 2)
+                finally:
+                    store._db = original
 
     async def test_ordinary_addressed_platform_id_is_not_requoted(self):
         with tempfile.TemporaryDirectory() as tmp:

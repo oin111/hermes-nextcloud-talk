@@ -11,10 +11,13 @@ from gateway.run import GatewayRunner
 from gateway.session import build_session_key
 try:
     from gateway.session_envelope import prepare_native, restore_native
-    from hermes_state_runtime import RuntimeStoreError
+    try:
+        from persistence.core.errors import AuthorityRefusal as NativeAdmissionRefusal
+    except ImportError:  # previous native-admission implementation
+        from hermes_state_runtime import RuntimeStoreError as NativeAdmissionRefusal
 except ImportError:  # older supported cores have no native-admission codec
     prepare_native = restore_native = None
-    RuntimeStoreError = RuntimeError
+    NativeAdmissionRefusal = RuntimeError
 import test_lifecycle_real as lifecycle
 
 
@@ -75,11 +78,11 @@ class NativeMetadataTests(unittest.IsolatedAsyncioTestCase):
             await self.wait_for_background(instance)
             event = captured[0]
             await prepare_native(runner, event)
-            with self.assertRaises(RuntimeStoreError) as bad_metadata:
+            with self.assertRaises(NativeAdmissionRefusal) as bad_metadata:
                 await prepare_native(runner, replace(event, metadata={'untrusted': True}))
             self.assertEqual(bad_metadata.exception.field, 'metadata')
             denied = replace(event, source=replace(event.source, user_id='mallory'))
-            with self.assertRaises(RuntimeStoreError) as bad_actor:
+            with self.assertRaises(NativeAdmissionRefusal) as bad_actor:
                 await prepare_native(runner, denied)
             self.assertEqual(bad_actor.exception.field, 'user_not_authorized')
 

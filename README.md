@@ -281,16 +281,14 @@ Failed handoff before persistence consumes nothing. Busy room followups do not
 fetch ahead of the active turn's persistence. Reset/new transcripts start fresh.
 
 Local routing and transcript scanning run off the event loop under the same
-wall-clock deadline as history reads. Since `load_transcript` has no bounded-read
-API, the plugin uses the resolved owning SessionDB's path and content decoder,
-with a separate **read-only SQLite connection**, a 50-ms lock timeout and a
-SQL progress deadline. It accepts at most 512 active user rows, 64 KiB per row
-and 1 MiB total; overflow or an unsupported store/schema skips enrichment
-rather than deduplicating from an incomplete scan. This is an optional,
-capability-dependent integration, not a change to the core database or codec.
-Modern stores use their reroute and owning-session database helpers. Legacy
-stores use a cycle-guarded local reroute map and their context-scoped database
-inside the context-preserving worker; cycles reject the entire snapshot. Core
+wall-clock deadline as history reads. The plugin resolves the owning scoped
+Persistence handle or legacy SessionDB, then reads a bounded projection using
+a separate **read-only SQLite connection**, a 50-ms lock timeout and a SQL
+progress deadline. It accepts at most 512 active user rows, 64 KiB per row and
+1 MiB total; overflow or an unknown owner/schema skips enrichment rather than
+deduplicating from an incomplete scan. This optional integration does not
+change the core database or codec. A cycle-guarded store-local reroute map is
+resolved inside the context-preserving worker; cycles reject the snapshot. Core
 authorization receives a thread keyword only when its callable supports it;
 local exact-thread filtering remains mandatory on every runtime.
 At most one enrichment task/worker operation is outstanding per adapter; no

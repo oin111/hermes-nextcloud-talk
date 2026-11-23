@@ -18,6 +18,11 @@ All notable changes to this project will be documented here.
   Keep the historical room-only policy solely on older supported cores lacking
   that resolver, with real-queue regression coverage for restricted approvals.
 
+- Keep mention-history enrichment working on both the current scoped Persistence
+  backend and older SessionDB runtimes with bounded read-only transcript scans.
+  Update the real-core history fixtures and clarify/native-admission tests for
+  upstream API changes; run the protected approval-card path in its own current-core CI job.
+
 ## [0.1.25] - 2026-11-12 (UTC)
 
 ### Added

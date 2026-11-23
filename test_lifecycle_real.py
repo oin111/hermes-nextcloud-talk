@@ -1225,7 +1225,14 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
 
             async def handler(event):
                 observed.append(event.text)
-                clarify_gateway.attempt_text_response_for_session(key, event.text)
+                if hasattr(clarify_gateway, "attempt_text_response"):
+                    pending = clarify_gateway.get_pending_for_session(
+                        key, include_choice_prompts=True
+                    )
+                    if pending is not None:
+                        clarify_gateway.attempt_text_response(pending.clarify_id, event.text)
+                else:  # older supported Hermes cores
+                    getattr(clarify_gateway, "attempt_text_response_for_session")(key, event.text)
                 return ""
 
             class Client:
@@ -1387,7 +1394,14 @@ class RealHermesLifecycleTests(unittest.IsolatedAsyncioTestCase):
                 if event.message_id == "201":
                     await asyncio.sleep(0.05)
                 observed.append(event.message_id)
-                clarify_gateway.attempt_text_response_for_session(key, event.text)
+                if hasattr(clarify_gateway, "attempt_text_response"):
+                    pending = clarify_gateway.get_pending_for_session(
+                        key, include_choice_prompts=True
+                    )
+                    if pending is not None:
+                        clarify_gateway.attempt_text_response(pending.clarify_id, event.text)
+                else:  # older supported Hermes cores
+                    getattr(clarify_gateway, "attempt_text_response_for_session")(key, event.text)
                 await instance.on_processing_complete(
                     event, adapter.ProcessingOutcome.SUCCESS
                 )

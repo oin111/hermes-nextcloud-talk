@@ -5606,25 +5606,29 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
 
     @staticmethod
     def _history_session_database(store, session_id, deadline):
-        follow = getattr(store, '_follow_reroutes', None)
-        if callable(follow):
-            session_id = follow(session_id)
-        else:
-            # Legacy append/load paths use this store-local reroute map. Do not
-            # guess a global DB path or accept a cycle's partially resolved ID.
-            reroutes = getattr(store, '_transcript_reroutes', {})
-            seen = set()
-            while session_id in reroutes:
-                if session_id in seen:
-                    raise ValueError('history transcript reroute cycle')
-                if time.monotonic() >= deadline:
-                    raise TimeoutError('history snapshot deadline')
-                seen.add(session_id)
-                session_id = reroutes[session_id]
+        # Both old and current append paths follow this store-local map. The
+        # current helper stops at a cycle; a history projection must reject it.
+        reroutes = getattr(store, '_transcript_reroutes', {})
+        seen = set()
+        while session_id in reroutes:
+            if session_id in seen:
+                raise ValueError('history transcript reroute cycle')
+            if time.monotonic() >= deadline:
+                raise TimeoutError('history snapshot deadline')
+            seen.add(session_id)
+            session_id = reroutes[session_id]
         owning_db = getattr(store, '_db_for_session_id', None)
-        # Legacy _db is profile-context scoped; this runs inside to_thread's
-        # copied context, just like the modern owning-session lookup.
-        db = owning_db(session_id) if callable(owning_db) else store._db
+        if callable(owning_db):
+            db = owning_db(session_id)
+        elif callable(getattr(store, '_persistence_for_session_id', None)):
+            # A missing owner may otherwise fall back to the ambient profile.
+            # An explicitly pinned handle has its own scope and is authoritative.
+            if store._db is None and not store._owner_key_for_session_id(session_id):
+                raise ValueError('history session owner unknown')
+            db = store._persistence_for_session_id(session_id)
+        else:
+            # Legacy _db follows the copied profile context inside to_thread.
+            db = store._db
         return session_id, db
 
     def _history_sender_authorized(self, actor, room, thread_id):
@@ -5646,7 +5650,15 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         session_id, db = NextcloudTalkAdapter._history_session_database(store, session_id, deadline)
         if db is None or getattr(store, '_dirty_transcripts', {}).get(session_id):
             raise ValueError('history transcript unavailable')
-        path = Path(db.db_path)
+        if hasattr(db, 'scope'):
+            from persistence_assembly import Persistence, store_location
+            if not isinstance(db, Persistence):
+                raise ValueError('history persistence handle unsupported')
+            path = store_location(db.scope)
+            if path is None:
+                raise ValueError('history store has no bounded SQLite projection')
+        else:
+            path = Path(db.db_path)
         if not path.is_file():
             raise ValueError('history database unavailable')
         rows, total = [], 0
@@ -5663,7 +5675,17 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
                     raise ValueError('history transcript bound exceeded')
                 if time.monotonic() >= deadline:
                     raise TimeoutError('history snapshot deadline')
-                content = db._decode_content(raw.decode('utf-8') if isinstance(raw, bytes) else raw)
+                content = raw.decode('utf-8') if isinstance(raw, bytes) else raw
+                if hasattr(db, 'scope'):
+                    # SQLite's stored structured content has a reserved marker;
+                    # do not interpret ordinary participant text as JSON.
+                    if isinstance(content, str) and content.startswith('\x00json:'):
+                        try:
+                            content = json.loads(content[6:])
+                        except (ValueError, TypeError):
+                            pass
+                else:
+                    content = db._decode_content(content)
                 rows.append({'role': 'user', 'message_id': platform_id, 'content': content})
         finally:
             connection.close()

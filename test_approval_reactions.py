@@ -39,6 +39,17 @@ def _approval_prompt(session_key="sess-1", chat_id="dm-room", choices=("once", "
 
 
 class ApprovalReactionTestBase(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Legacy unit cases mock the old resolver to isolate reaction parsing.
+        # The real guarded core policy is covered by test_approval_integration.
+        from tools import approval
+        if hasattr(approval, "resolve_gateway_approval_card"):
+            def legacy_bridge(session_key, choice, request_id, **_kwargs):
+                return approval.resolve_gateway_approval(session_key, choice, request_id=request_id)
+            guard = patch.object(approval, "resolve_gateway_approval_card", side_effect=legacy_bridge)
+            guard.start()
+            self.addCleanup(guard.stop)
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.reaction_seeds = []

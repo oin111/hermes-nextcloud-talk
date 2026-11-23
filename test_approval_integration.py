@@ -11,6 +11,19 @@ from test_room_lock_commands import _Client, _msg
 
 
 class ApprovalPollIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    def setUp(self):
+        # Legacy lifecycle probes mock the old resolver to test ACK ordering.
+        # Keep their mock seam while the dedicated core-policy probe below
+        # explicitly restores the REAL guarded resolver.
+        from tools import approval
+        self._real_card_resolver = getattr(approval, "resolve_gateway_approval_card", None)
+        if self._real_card_resolver is not None:
+            def legacy_bridge(session_key, choice, request_id, **_kwargs):
+                return approval.resolve_gateway_approval(session_key, choice, request_id=request_id)
+            guard = patch.object(approval, "resolve_gateway_approval_card", side_effect=legacy_bridge)
+            guard.start()
+            self.addCleanup(guard.stop)
+
     make_adapter = room_tests.RoomLockCommandTests.make_adapter
     session_key = room_tests.RoomLockCommandTests.session_key
     start_turn = room_tests.RoomLockCommandTests.start_turn
@@ -53,6 +66,115 @@ class ApprovalPollIntegrationTests(unittest.IsolatedAsyncioTestCase):
             reloaded = self.make_adapter(tmp)
             reloaded._load_cursors()
             self.assertTrue(reloaded._is_acknowledged("room", 101))
+
+    async def test_core_request_id_card_resolves_exact_request(self):
+        """The current core passes request_id separately from Talk metadata."""
+        import inspect
+        import types
+        if not hasattr(adapter.BasePlatformAdapter, "send_exec_approval") or (
+            "request_id" not in inspect.signature(adapter.BasePlatformAdapter.send_exec_approval).parameters
+        ):
+            self.skipTest("core predates request_id")
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            client = _Client([])
+            async def post(*_args, **_kwargs):
+                return {"id": 500}
+            async def react(*_args, **_kwargs):
+                return None
+            client.send_message = post
+            client.add_reaction = react
+            client.remove_reaction = react
+            instance._client = client
+            instance.send = types.MethodType(type(instance).send, instance)
+            with patch.object(adapter.asyncio, "sleep", return_value=None):
+                result = await instance.send_exec_approval(
+                    "room", "harmless probe", "session", request_id="req-1",
+                    allow_permanent=False, allow_session=False,
+                )
+            self.assertTrue(result.success)
+            self.assertEqual(instance._approval_prompts_by_event["500"].request_id, "req-1")
+            from tools import approval
+            from tools.approval_gateway_wait import _ApprovalEntry
+            entry = _ApprovalEntry({"request_id": "req-1", "command": "harmless probe"})
+            entry.authority = {"requester_id": "alice", "approvers": [], "chat_type": "dm"}
+            entry.card_deny_only = False
+            prior = approval._gateway_queues.get("session")
+            approval._gateway_queues["session"] = [entry]
+            row = _msg(101, "✅", messageType="system", systemMessage="reaction",
+                       parent=500, actorId="alice")
+            try:
+                if self._real_card_resolver is not None:
+                    with patch.object(approval, "resolve_gateway_approval_card", self._real_card_resolver):
+                        self.assertTrue(await instance._handle_approval_system_message(row, "room"))
+                else:
+                    self.assertTrue(await instance._handle_approval_system_message(row, "room"))
+                self.assertEqual(entry.result, "once")
+            finally:
+                if prior is None:
+                    approval._gateway_queues.pop("session", None)
+                else:
+                    approval._gateway_queues["session"] = prior
+
+    async def test_native_card_obeys_core_deny_only_and_actor_policy(self):
+        """A Talk reaction must not bypass the core's per-request gate."""
+        from tools import approval
+        if not hasattr(approval, "resolve_gateway_approval_card"):
+            self.skipTest("core predates guarded card resolver")
+        from tools.approval_gateway_wait import _ApprovalEntry
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance._client = _Client([])
+            self.register(instance)
+            prompt = instance._approval_prompts_by_event["500"]
+            prompt.request_id = "secure-req"
+            entry = _ApprovalEntry({"request_id": "secure-req", "command": "probe"})
+            entry.authority = {"requester_id": "alice", "approvers": [], "chat_type": "dm"}
+            prior = approval._gateway_queues.get("session")
+            approval._gateway_queues["session"] = [entry]
+            def tap(numeric_id, actor):
+                return _msg(numeric_id, "✅", messageType="system", systemMessage="reaction",
+                            parent=500, actorId=actor)
+            try:
+                with patch.object(approval, "resolve_gateway_approval_card", self._real_card_resolver):
+                    await instance._handle_approval_system_message(tap(101, "alice"), "room")
+                    self.assertIsNone(entry.result, "Approve must be blocked until the card shows the full command")
+                    approval.restrict_gateway_approval_card_to_deny("session", "secure-req", restricted=False)
+                    await instance._handle_approval_system_message(tap(102, "bob"), "room")
+                    self.assertIsNone(entry.result, "An admitted non-approver must not approve")
+                    await instance._handle_approval_system_message(tap(103, "alice"), "room")
+                    self.assertEqual(entry.result, "once")
+            finally:
+                if prior is None:
+                    approval._gateway_queues.pop("session", None)
+                else:
+                    approval._gateway_queues["session"] = prior
+
+    async def test_unbound_card_cannot_settle_current_core_queue(self):
+        from tools import approval
+        if not hasattr(approval, "resolve_gateway_approval_card"):
+            self.skipTest("core predates guarded card resolver")
+        from tools.approval_gateway_wait import _ApprovalEntry
+        with tempfile.TemporaryDirectory() as tmp:
+            instance = self.make_adapter(tmp)
+            instance._client = _Client([])
+            self.register(instance)  # legacy card with no request ID
+            entry = _ApprovalEntry({"request_id": "new-request", "command": "probe"})
+            entry.authority = {"requester_id": "alice", "approvers": ["*"], "chat_type": "dm"}
+            prior = approval._gateway_queues.get("session")
+            approval._gateway_queues["session"] = [entry]
+            try:
+                with patch.object(approval, "resolve_gateway_approval_card", self._real_card_resolver):
+                    row = _msg(101, "✅", messageType="system", systemMessage="reaction",
+                               parent=500, actorId="alice")
+                    await instance._handle_approval_system_message(row, "room")
+                    self.assertIsNone(entry.result)
+                    self.assertTrue(instance._is_acknowledged("room", 101))
+            finally:
+                if prior is None:
+                    approval._gateway_queues.pop("session", None)
+                else:
+                    approval._gateway_queues["session"] = prior
 
     async def test_idle_reaction_is_consumed_once_and_settles(self):
         with tempfile.TemporaryDirectory() as tmp:

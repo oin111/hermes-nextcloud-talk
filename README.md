@@ -59,13 +59,14 @@ Seeding failure retracts attempted bot reactions and returns failure so Hermes c
 use its plain-text approval fallback. `/approve`, `/deny` and `/stop` keep the existing
 busy-session owner checks independently of the native-reaction path.
 
-**Authorization is the room's effective user allowlist, not requester binding.**
-Released Hermes does not pass `requester_user_id` or an approval request ID into this
-adapter hook. Any allowlisted participant in the card's room may therefore answer it;
-use a private room and a narrow allowlist for sensitive approvals. Display names do not
-authorize anyone. Without request-ID metadata, a tap resolves the oldest pending
-approval in that session (FIFO), which need not be the newest displayed card. A
-compatible caller may supply `approval_request_id` metadata to bind an exact request.
+**Authorization depends on the core's card policy as well as the room allowlist.**
+Current Hermes passes an exact approval request ID; the Talk reaction uses the core's
+card resolver, which checks that ID, the clicker's approval/slash authority and the
+Deny-only state before settling. An unbound card cannot resolve a request on that
+runtime. Older supported cores lack this protected resolver and keep their historical
+room-allowlist/FIFO behavior; use a private room and narrow allowlist there. Display
+names never authorize anyone. Legacy callers may supply `approval_request_id` in
+metadata to bind an exact request when the core does not expose it as a prompt field.
 Bot seed reactions, removals, unknown emoji and choices not offered on the card never
 approve. Cards are process-local and cleared on disconnect.
 
@@ -634,7 +635,7 @@ Please report security issues privately as described in [SECURITY.md](SECURITY.m
 
 ## Compatibility
 
-The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.25 targets the Python 3.11–3.13 compatibility CI matrix and Python 3.14 for the pinned modern native-admission core. Profile isolation under
+The plugin uses Hermes' public plugin/platform adapter interfaces, but those interfaces may evolve. Version 0.1.26 targets the Python 3.11–3.13 compatibility CI matrix and Python 3.14 for the pinned modern native-admission core. Profile isolation under
 `gateway.multiplex_profiles` needs the shared scoped readers (`gateway.platforms._shared`) or, failing that, `agent.secret_scope` — see "Multiple profiles under one gateway" above.
 
 ## License

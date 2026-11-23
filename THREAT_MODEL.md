@@ -119,11 +119,12 @@ Report any way to break one of these:
 - **Native approval reactions are an explicit system-message exception.** A reaction
   must target a registered card in the same room, have a stable authorized user/guest
   actor, and select an offered choice; bot seeds and reaction removals cannot approve.
-  Released Hermes provides no requester or request ID in the adapter hook, so the
-  effective room user allowlist is the authority: another allowlisted room participant
-  may answer. An unbound tap resolves the session's oldest pending approval (FIFO),
-  not necessarily the newest card. Exact request binding applies only when a caller
-  supplies optional request-ID metadata. Do not claim requester isolation.
+  On current Hermes the core's guarded card resolver checks the exact request ID,
+  the clicker's authority and Deny-only status atomically. An unbound tap cannot
+  settle a pending request there. Older supported cores without that resolver retain
+  the historical room-allowlist/FIFO behavior: another allowlisted participant may
+  answer, so use a private room and narrow allowlist on those runtimes. Legacy
+  request-ID metadata binds the request when supplied; display names are never authority.
 - **Filesystem confinement.** Downloaded files land only in the Hermes document cache directory
   with a sanitized name; WebDAV paths are decoded a bounded number of times and refused if absolute,
   ambiguous, containing traversal components, or escaping the user's namespace.

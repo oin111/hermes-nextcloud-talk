@@ -70,7 +70,7 @@ import weakref
 from contextvars import ContextVar
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional, Set
+from typing import Any, Callable, Dict, List, Optional, Set, cast
 from urllib import error, parse, request
 
 try:
@@ -161,7 +161,7 @@ from gateway.platforms.base import (
 logger = logging.getLogger(__name__)
 
 
-_RELEASED_VERSION = "0.1.25"
+_RELEASED_VERSION = "0.1.26"
 _VERSION_RE = re.compile(r"[A-Za-z0-9._+-]{1,64}")
 
 
@@ -4128,18 +4128,19 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
     # self rows are skipped by username comparison before any prompt lookup.
 
     async def send_exec_approval(
-        self, chat_id: str, command: str, session_key: str, description: str = "dangerous command",
+        self, chat_id: str, command: str, session_key: str, description: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None, allow_permanent: bool = True, allow_session: bool = True,
-        smart_denied: bool = False,
+        smart_denied: bool = False, request_id: Optional[str] = None,
     ) -> SendResult:
         """Native reaction approvals; inherited core code builds the shared text
         and the choice set, then _send_exec_approval_prompt renders them as seeded
         Talk reactions. Fail-closed: a SendResult(success=False) makes the gateway
         fall back to its plain-text /approve prompt."""
+        kwargs = {"request_id": request_id} if request_id is not None else {}
         return await super().send_exec_approval(
             chat_id=chat_id, command=command, session_key=session_key,
             description=description, metadata=metadata, allow_permanent=allow_permanent,
-            allow_session=allow_session, smart_denied=smart_denied,
+            allow_session=allow_session, smart_denied=smart_denied, **kwargs,
         )
 
     async def _send_exec_approval_prompt(self, prompt: Any) -> SendResult:
@@ -4173,7 +4174,10 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         # Hermes-core approval request_id (set by run_turn_runner when available): binds this
         # Talk card to EXACTLY one queued approval so a reaction resolves the right request
         # even when the same session has several pending exec approvals.
-        request_id = str((prompt.metadata or {}).get("approval_request_id") or "").strip()
+        request_id = str(
+            getattr(prompt, "request_id", None)
+            or (prompt.metadata or {}).get("approval_request_id") or ""
+        ).strip()
         reactions: List[str] = []
         for _label, choice, _style in prompt.actions:
             emoji = _APPROVAL_EMOJI_BY_CHOICE.get(choice)
@@ -4341,12 +4345,23 @@ class NextcloudTalkAdapter(BasePlatformAdapter):
         self._commit_cursor(room_token, numeric_id)
         resolved_count = 0
         try:
-            from tools.approval import resolve_gateway_approval
-            # Resolve by the bound request_id when core provided one — a session with several
-            # pending approvals must never resolve the FIFO-oldest from a newest-card tap.
-            resolved_count = int(resolve_gateway_approval(
-                prompt.session_key, choice, request_id=prompt.request_id or None,
-            ) or 0)
+            from tools import approval as approval_engine
+            card_resolver = getattr(approval_engine, "resolve_gateway_approval_card", None)
+            if callable(card_resolver):
+                card_resolver = cast(Callable[..., int], card_resolver)
+                # Current core checks the card's exact ID, Deny-only state and
+                # the tapper's approval/slash authority in one critical section.
+                # An unbound legacy card resolves nothing on this runtime.
+                resolved_count = int(card_resolver(
+                    prompt.session_key, choice, prompt.request_id or None,
+                    actor_id=actor_id, extra=getattr(getattr(self, "config", None), "extra", None),
+                ) or 0)
+            else:
+                # Older supported cores have no card policy API. Preserve their
+                # historical room-allowlist behavior only on those runtimes.
+                resolved_count = int(approval_engine.resolve_gateway_approval(
+                    prompt.session_key, choice, request_id=prompt.request_id or None,
+                ) or 0)
         except Exception as exc:
             logger.error(
                 "[nextcloud_talk] Failed to resolve gateway approval from reaction: %s",

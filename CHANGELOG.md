@@ -2,6 +2,22 @@
 
 All notable changes to this project will be documented here.
 
+## [0.1.26] - 2026-11-23 (UTC)
+
+### Fixed
+
+- Accept and forward the core's approval request ID when sending a native Talk
+  approval card. Bind the seeded reaction choices to that exact request rather
+  than letting a current-core argument mismatch force the text-command fallback
+  or letting a reaction settle another queued request in the same session.
+- Preserve the older core's approval-call shape when it does not supply a
+  request ID. Exercise the public card send and reaction-resolution path in the
+  real-core integration suite.
+- Use the current core's guarded card resolver for native Talk reactions so
+  request-level clicker authority and Deny-only restrictions cannot be bypassed.
+  Keep the historical room-only policy solely on older supported cores lacking
+  that resolver, with real-queue regression coverage for restricted approvals.
+
 ## [0.1.25] - 2026-11-12 (UTC)
 
 ### Added
